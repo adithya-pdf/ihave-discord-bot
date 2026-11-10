@@ -1,8 +1,11 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 .venv/
 data/
 *.db
 .vercel/
 .pytest_cache/
+*.log
