@@ -1,210 +1,269 @@
-# `;ihave` — Codeforces time-boxed practice bot
+# `ihave` — Vercel slash-command bot for Codeforces practice
 
-A single-process, asynchronous Discord bot that answers one question:
+A Discord **HTTP Interactions** app that recommends an unsolved Codeforces
+problem for a time budget (`/ihave minutes:30`), hides the tags, keeps a personal
+minutes-per-rating curve, and tracks an active session.
 
-> *"I have 30 minutes. Which Codeforces problem should I solve right now?"*
+This version is built for **Vercel Functions**, not the Discord gateway. Discord
+POSTs slash commands and button clicks to one HTTPS endpoint; the app verifies
+the Ed25519 signature, returns a deferred response, and uses Vercel's
+`wait_until` to finish Codeforces calls and edit the message.
 
-You link your Codeforces handle, the bot learns how many minutes you typically
-spend on each problem rating from your **live and virtual contest history**, and
-then serves a recent, unsolved problem at the rating your personal speed curve
-says fits your time budget. Problem tags stay hidden so the rating label does
-not spoil the approach.
-
-No web backend, no external database server, no Docker, no ML libraries — just
-`discord.py`, `aiohttp`, `matplotlib`, `numpy`, and a local SQLite file
-accessed through `aiosqlite`.
-
----
-
-## Features
-
-- **`;link <handle>`** — validates the handle with the public Codeforces API,
-  syncs submissions, and builds the initial time-per-rating curve.
-- **`;ihave <minutes> [rating]`** — 5 to 180 minute practice session. Picks a
-  random recent unsolved problem, hides the rating in a Discord spoiler and
-  hides tags entirely, then polls Codeforces every 60 seconds for an Accepted
-  submission.
-- **`;adjust <rating> <minutes>`** — manual calibration ("I can consistently
-  solve 1700s in 30 minutes"), persisted as an override and re-applied after
-  every `;sync`.
-- **`;curve [handle]`** — renders a clean Matplotlib chart (minutes vs rating)
-  and posts a smoothed per-rating table next to it.
-- **`;status`** — active session, remaining time, and target problem.
-- **`;giveup`** — ends the session and reveals the rating and tags inside
-  Discord spoiler tags (`||graphs, dp||`).
-- **`;sync`** — refreshes submissions, rebuilds the curve, and refreshes the
-  local problemset cache if it is older than 24 hours.
-- **Interactive feedback** — `⚡ Too Easy` / `😅 Too Hard` buttons adjust the
-  expected time for that rating by −15% / +20% while keeping the curve
-  non-decreasing.
+> **Important:** serverless mode has no persistent process, so there is no
+> automatic 60-second AC poller by default. `/status` performs an on-demand
+> check, and an optional `/api/cron/poll` endpoint can drive automatic checks on
+> a schedule. See [Session tracking](#session-tracking) and
+> [Optional cron polling](#optional-cron-polling).
 
 ---
 
-## Requirements
+## What runs where
 
-- Python **3.12**
-- A Discord application/bot token
-- Internet access to `codeforces.com` (no API key or OAuth needed)
+```
+Discord  --POST /api/interactions-->  main.py (FastAPI on Vercel)
+                                        |
+                                        +-- Ed25519 signature check
+                                        +-- deferred response (3s limit)
+                                        +-- wait_until(...)
+                                              |
+                                              +-- Codeforces API (aiohttp)
+                                              +-- Upstash Redis (state)
+                                              +-- Discord webhook (edit response)
+                                              +-- matplotlib (optional chart)
+```
 
-Install dependencies:
+- **No gateway WebSocket**, no `on_message`, no `on_ready`, no member events.
+- **No local SQLite**: Vercel Functions have an ephemeral filesystem, so state
+  lives in Redis (Upstash or Vercel KV).
+- **No long-running background loop** inside the request. The optional cron
+  endpoint is the only scheduled work.
+
+| Capability | Status |
+|---|---|
+| Slash commands | Yes |
+| Buttons (`Too Easy` / `Too Hard`) | Yes |
+| Personal curve / chart | Yes |
+| Link + sync from Codeforces | Yes |
+| Manual `/status` AC check | Yes |
+| Automatic 60s polling | Only with a cron schedule (Pro/external) |
+| Read normal chat messages | **No** — HTTP interactions only |
+| Join/leave events | **No** |
+| Local SQLite | Replaced by Redis |
+
+---
+
+## Setup
+
+### 1. Create the Discord application
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications)
+   and create an application.
+2. On **General Information**, copy:
+   - **Application ID** → `DISCORD_APPLICATION_ID`
+   - **Public Key** → `DISCORD_PUBLIC_KEY`
+3. On **Bot**, reset/copy the token → `DISCORD_BOT_TOKEN`.
+4. **You do not need the Message Content Intent.** This bot never reads messages.
+5. Invite the app with both scopes `bot` and `applications.commands`:
+
+   ```
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=117760&scope=bot%20applications.commands
+   ```
+
+   `117760` covers View Channels, Send Messages, Embed Links, Attach Files and
+   Read Message History. Adjust if you want fewer permissions.
+
+### 2. Create Redis
+
+On Vercel, use one of:
+
+- **Upstash Redis** from the Vercel Marketplace, or an Upstash database directly.
+- **Vercel KV** (Upstash-backed), if your project uses it.
+
+Set either pair of environment variables:
+
+```env
+UPSTASH_REDIS_REST_URL=https://...
+UPSTASH_REDIS_REST_TOKEN=...
+```
+
+or:
+
+```env
+KV_REST_API_URL=https://...
+KV_REST_API_TOKEN=...
+```
+
+On Vercel the app **requires** Redis. Local development falls back to an
+in-process memory store (data disappears when the process exits).
+
+### 3. Deploy to Vercel
+
+Using the Vercel CLI:
 
 ```bash
-python -m venv .venv
+npm i -g vercel
+vercel
+vercel --prod
+```
 
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-source .venv/bin/activate
+Or connect the GitHub repository in the Vercel dashboard. No build command is
+needed; Vercel detects `main.py` as the Python entrypoint.
 
-pip install -r requirements.txt
+Set these environment variables in **Project → Settings → Environment
+Variables** (Production and Preview as needed):
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DISCORD_PUBLIC_KEY` | Yes | Verifies every Discord interaction |
+| `DISCORD_APPLICATION_ID` | Yes | Builds webhook edit URLs |
+| `DISCORD_BOT_TOKEN` | Yes | `/api/cron/poll` sends channel messages; command registration |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Yes on Vercel | Durable state |
+| `KV_REST_API_URL` / `KV_REST_API_TOKEN` | Alternative | Vercel KV names |
+| `CRON_SECRET` | Optional | Protects `/api/cron/poll`; enables the cron footer |
+| `GUILD_ID` | Optional | Register commands in one guild for instant updates |
+| `ALLOW_INSECURE_INTERACTIONS` | Local only | `1` skips signature verification |
+| `LOG_LEVEL` | Optional | Defaults to `INFO` |
+
+### 4. Set the Interactions Endpoint URL
+
+After the production deployment exists, copy its URL and set:
+
+```
+https://YOUR-PROJECT.vercel.app/api/interactions
+```
+
+in **General Information → Interactions Endpoint URL**. Discord immediately
+sends a signed `PING`; the app must answer with `{"type": 1}`. Save only after it
+verifies.
+
+### 5. Register the slash commands
+
+From the project root, with the same environment variables available:
+
+```bash
+python register_commands.py
+```
+
+Global commands can take a few minutes to appear. Set `GUILD_ID` for instant
+guild-scoped registration during testing.
+
+### 6. Test
+
+```
+/help
+/link handle:tourist
+/ihave minutes:30
+/status
 ```
 
 ---
 
-## Discord bot setup
+## Local development
 
-1. Open the [Discord Developer Portal](https://discord.com/developers/applications)
-   and create a new application.
-2. Go to **Bot** → **Add Bot**.
-3. Under **Privileged Gateway Intents**, enable **Message Content Intent**.
-   Prefix commands cannot read `;ihave 30` without it.
-4. Copy the bot token.
-5. Invite the bot with the `bot` scope and these permissions:
-   **View Channels**, **Send Messages**, **Embed Links**, **Attach Files**,
-   **Read Message History**.
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux/macOS
+pip install -r requirements.txt
 
-   Replace `YOUR_APP_ID` in this URL:
+# .env with the same keys as above
+uvicorn main:app --reload --port 8000
+```
 
-   ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=117760&scope=bot
-   ```
+Without Redis env vars, `storage.py` uses an in-memory backend: useful for
+clicking through `/help` locally, but it is not shared between processes and is
+not suitable for Vercel. To send unsigned local test requests, set:
 
-6. Configure the environment:
+```env
+ALLOW_INSECURE_INTERACTIONS=1
+```
 
-   ```bash
-   cp .env.example .env
-   ```
+Never set that in production.
 
-   `.env`:
-
-   ```env
-   DISCORD_TOKEN=your_real_token_here
-   DEFAULT_CF_HANDLE=
-   ```
-
-   `DEFAULT_CF_HANDLE` is optional. When set, `;link` can be used without an
-   argument and `;curve` falls back to that handle.
-
-7. Run the bot:
-
-   ```bash
-   python bot.py
-   ```
-
-   The bot creates `data/bot.db` on first start and warms the problemset cache
-   in the background (a few seconds; the public API is intentionally paced).
-
-Optional environment variables:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `DISCORD_TOKEN` | — | Bot token (required). |
-| `DEFAULT_CF_HANDLE` | empty | Fallback handle for `;link` / `;curve`. |
-| `BOT_DB_PATH` | `data/bot.db` | Alternative SQLite path (directory is created). |
-| `LOG_LEVEL` | `INFO` | Python log level. |
+To test real Discord interactions locally, expose port 8000 with a tunnel
+(`ngrok http 8000`) and use the tunnel URL as the Interactions Endpoint URL.
+Discord will verify the signature against your public key.
 
 ---
 
 ## Commands
 
-| Command | Example | Description |
-| --- | --- | --- |
-| `;link` | `;link tourist` | Link a handle, sync submissions, build the curve. |
-| `;ihave` | `;ihave 30` or `;ihave 45 1700` | Start a session for 5–180 minutes, optionally forcing a rating. |
-| `;adjust` | `;adjust 1700 30` | Record "1700 in 30 minutes" and re-smooth the curve. |
-| `;curve` | `;curve` or `;curve tourist` | Post the chart and the smoothed rating table. |
-| `;status` | `;status` | Show the active session and countdown. |
-| `;giveup` | `;giveup` | Cancel and reveal rating + tags in spoilers. |
-| `;sync` | `;sync` | Refresh submissions, curve, and problemset cache. |
-| `;help` | `;help` | Command reference. |
+| Command | Description |
+|---|---|
+| `/link handle:<handle>` | Validate the handle, sync submissions and build the curve. |
+| `/ihave minutes:<5-180> [rating:<800-3500>]` | Start a time-boxed session with an optional rating override. |
+| `/adjust rating:<800-3500> minutes:<1-600>` | Record "I solve this rating in this time" and re-smooth. |
+| `/curve [handle:<handle>]` | Post the PNG chart and the smoothed minutes-per-rating table. |
+| `/status` | Show the session and check Codeforces for a new AC. |
+| `/giveup` | End the session and reveal rating/tags in `||spoilers||`. |
+| `/sync` | Refresh submissions, curve and the problemset cache if stale. |
+| `/help` | Command reference. |
 
-`;link` also sends the one-time virtual-contest tip:
+`/link` also sends the tip:
 
 > Make sure to register for Virtual Contests before starting them! Unregistered
 > practice submissions are ignored by the time-curve to keep your data accurate.
 
 ---
 
-## How the estimation algorithm works
+## How the estimation works
 
-Everything below lives in [`estimator.py`](estimator.py) and is pure logic
-(numpy only), which is why it can be unit tested without Discord, SQLite, or
-network access.
+The math is unchanged; it lives in [`estimator.py`](estimator.py) and is pure
+numpy, with no Discord or storage dependencies.
 
 ### 1. Contest submissions only
 
-From `user.status` we keep submissions where:
+From `user.status`, keep submissions where:
 
 - `verdict == "OK"`
 - `author.participantType` is `CONTESTANT` or `VIRTUAL`
 - the problem has a `rating`
 - `0 < relativeTimeSeconds <= 18000` (five hours)
 
-Practice submissions are deliberately ignored: unregistered practice says
-nothing reliable about contest speed.
+Practice submissions are ignored.
 
-### 2. Per-contest time deltas
+### 2. Per-contest deltas
 
-Accepted submissions are grouped by
-`(contestId, participantType, author.startTimeSeconds)` — so a virtual restart
-is its own participation. Within a participation:
+Group by `(contestId, participantType, author.startTimeSeconds)`. Within one
+participation:
 
-- keep only the **earliest** AC per `problem.index`;
-- sort the solved problems by `relativeTimeSeconds`:
-  `t1 <= t2 <= ... <= tk`;
-- the time spent on each problem is
+- keep the **earliest AC per problem index**;
+- sort by `relativeTimeSeconds`;
+- compute:
 
   ```
   Δ1 = t1 / 60
   Δi = (ti - t(i-1)) / 60
   ```
 
-`relativeTimeSeconds` is already relative to contest start, so no external start
-timestamp is subtracted.
+`relativeTimeSeconds` is already contest-relative.
 
-### 3. Recency filter
+### 3. Recency
 
-Only the **35 most recent distinct contest participations** feed the curve.
-Recency is ordered by contest id (which grows over time) and participation start
-time, so a user's current speed dominates the estimate.
+Only the **35 most recent distinct contest participations** are used.
 
-### 4. Robust aggregation
+### 4. Robust buckets
 
-Δ values are bucketed by rating on the 800…3500 / step-100 grid. A bucket needs
-at least **2** solves to produce a raw average. Buckets with 4+ solves use a 10%
-trimmed mean (at least one value trimmed from each end); tiny buckets use the
-median. This keeps a single 3-minute fluke from defining a rating.
+Bucket Δ by rating (800…3500, step 100). A bucket needs at least **2 solves**.
+Four or more solves use a 10% trimmed mean; smaller buckets use the median.
 
-### 5. Monotonic smoothing (numpy only, no scikit-learn)
+### 5. Monotonic smoothing
 
-Higher ratings can show *lower* raw averages because of survivorship bias: in a
-two-hour contest only the easy problems of the highest ratings get solved at
-all. To remove those impossible dips:
+Higher ratings can look faster in raw data because only their easy problems were
+solved (survivorship bias). The estimator:
 
-1. `numpy.interp` fills missing rating buckets by linear interpolation between
-   observed buckets (and clamps beyond the observed range).
-2. `numpy.maximum.accumulate` performs a forward cumulative maximum, making the
-   final curve non-decreasing in rating.
+1. interpolates missing buckets with `numpy.interp`;
+2. applies `numpy.maximum.accumulate` to force a non-decreasing curve.
 
-Raw averages are retained separately for the dashed line on the chart.
+No scikit-learn.
 
 ### 6. Cold start
 
-If the user has **fewer than 5 rated contests** (or no usable buckets), the
-curve is anchored around their current rating `R` (1500 if unrated):
+With fewer than 5 rated contests, anchor around the current Codeforces rating
+`R` (1500 if unrated):
 
 | Rating | Minutes |
-| --- | --- |
+|---|---|
 | `R - 300` | 12 |
 | `R - 200` | 18 |
 | `R - 100` | 28 |
@@ -212,192 +271,175 @@ curve is anchored around their current rating `R` (1500 if unrated):
 | `R + 100` | 55 |
 | `R + 200` | 75 |
 
-The anchors are interpolated onto the grid, extrapolated for very low/high
-ratings, clamped to 3–240 minutes, and made non-decreasing.
+### 7. Time → rating
 
-### 7. Reverse lookup for `;ihave`
+For `/ihave minutes:Y`:
 
-Given `target_minutes`:
-
-1. Pick the **highest** rating whose smoothed time is
-   `<= target_minutes * 1.08`.
-2. If every rating is too slow, pick the bucket closest to the target by
-   absolute difference.
-3. Clamp to `[max(800, current_rating - 500), current_rating + 300]`, snap to
+1. `limit = Y * 1.08`;
+2. choose the **highest** rating whose smoothed time is `<= limit`;
+3. if none qualify, choose the closest by absolute difference;
+4. clamp to `[max(800, current_rating - 500), current_rating + 300]`, snapped to
    the 100-point grid.
 
-The 8% tolerance prevents a 29.9-minute curve value from being rejected for a
-30-minute request.
+The 8% tolerance keeps a 30-minute request from rejecting a 31-minute estimate.
 
 ### 8. Problem selection
 
-From the local `problems` cache:
+From the cached problemset:
 
-- only the **400 highest contest ids** (recent problems);
-- only the requested rating (adjacent tiers are tried if the exact tier has no
-  eligible problem);
-- excluding every problem present in `user_solved` — including practice solves;
-- prefer the **top 70% by `solved_count`** within the tier, then pick uniformly
-  at random from that pool.
-
-### 9. Session tracking
-
-`;ihave` performs a quick 25-submission sync first, records the ids of those
-submissions, then polls `user.status` every 60 seconds. A submission counts as
-the session win when it is a new id, has verdict `OK`, and matches the target
-`contestId` + `index`. Elapsed time comes from the submission's
-`creationTimeSeconds`.
-
-Sessions live in memory only; a bot restart forgets active timers (documented
-limitation).
-
-### 10. Feedback buttons
-
-- `⚡ Too Easy` targets `old_minutes * 0.85` (−15%).
-- `😅 Too Hard` targets `old_minutes * 1.20` (+20%).
-
-The bot then **pins** the smoothed curve through that exact point: ratings at or
-below it are capped at the new value, ratings above it are floored at the new
-value. For a non-decreasing curve this is the minimal change that keeps the
-curve monotonic, so the requested adjustment is actually visible at that rating
-instead of being swallowed by a forward-maximum pass. Both buttons are disabled
-after one adjustment per session to prevent accidental stacking.
-
-Button tweaks are tuning signals, not permanent calibration: they update
-`smoothed_minutes` but not `curve_overrides`, so a later `;sync` rebuilds from
-fresh contest history. Use `;adjust` for a durable override.
-
-### 11. Manual calibration and monotonic projection
-
-`;adjust 1700 30` records the point in `curve_overrides` and pins the curve
-through `(1700, 30)`. On every subsequent `;sync`, the fresh contest-derived
-curve is recomputed and all stored overrides are pinned into it in ascending
-rating order. This makes manual calibration survive data refreshes while the
-result remains non-decreasing: if you say you solve 1700s in 30 minutes, slower
-neighbouring buckets are pulled down (or faster neighbours pushed up) just
-enough to keep the curve consistent.
+- one of the **400 highest contest ids**;
+- exact rating first, then nearby tiers (`±100`, `±200`, …);
+- exclude every problem in the user's solved set, including practice solves;
+- prefer the **top 70% by `solved_count`** within the tier;
+- pick uniformly at random from that pool.
 
 ---
 
-## Codeforces API, caching, and rate limiting
+## Session tracking
 
-`cf_api.py` uses only public endpoints:
+`/ihave` stores a session in Redis with:
 
-| Endpoint | Use |
-| --- | --- |
-| `problemset.problems` | Problem metadata + solved counts, cached for 24h. |
-| `user.info` | Handle validation, canonical spelling, current rating. |
-| `user.status` | Submission history, quick sync, session polling. |
-| `contest.list` | Only to identify April Fools / Kotlin Heroes contests by name. Falls back to a curated denylist if unavailable. |
+- the problem, rating and tags;
+- `started_at`, `expires_at`;
+- the ids of the latest submissions at session start (`baseline_ids`);
+- the Discord user and channel.
 
-**Rate limiting:** a module-level singleton `asyncio.Lock` serializes every
-request from the whole process — command handlers, cache refresh, and all
-background pollers. Inside the lock the client sleeps until at least **2.05
-seconds** have passed since the previous request started, then timestamps the
-new request. This keeps the bot far below Codeforces' public call limit.
+There is no always-on poller. `/status`:
 
-**Retries:** network timeouts/connection errors, HTTP 429, and HTTP 5xx are
-retried up to 4 times with exponential backoff (3s, 6s, 12s, longer on 429).
-Every attempt has a 30-second timeout. API-level failures (unknown handle, bad
-request) raise `CFError` with a human-friendly message that the bot posts
-directly.
+1. fetches the user's latest 25 submissions;
+2. looks for an `OK` submission with a **new id** matching the target
+   `contestId` + `index`;
+3. on success, marks it solved and reveals rating/tags;
+4. if the timer expired, reports time-up and tells the user to run `/giveup`.
 
-**Special contests:** problems without a rating are dropped, as are all
-problems from contests whose name contains "April Fools", "Kotlin Heroes", or
-"Kotlin", plus a known-id denylist as a fallback.
+The `Too Easy` / `Too Hard` buttons update the curve by `-15%` / `+20%` with a
+monotonic pin; one feedback click per session is enforced with a Redis `SET NX`.
 
 ---
 
-## Database
+## Optional cron polling
 
-SQLite lives at `data/bot.db` (auto-created with `os.makedirs("data",
-exist_ok=True)`). All access uses `aiosqlite`; WAL mode is enabled.
+`/api/cron/poll` iterates active sessions, checks Codeforces, announces ACs or
+timeouts via `DISCORD_BOT_TOKEN`, and clears finished sessions. It requires:
 
-```
-problems(contest_id, index_name, name, rating, solved_count, tags)
-    PRIMARY KEY (contest_id, index_name)
-
-users(discord_id, cf_handle, current_rating, last_synced)
-    PRIMARY KEY (discord_id)
-
-user_solved(cf_handle, contest_id, index_name)
-    PRIMARY KEY (cf_handle, contest_id, index_name)
-
-user_curve(cf_handle, rating, raw_minutes, smoothed_minutes, sample_size)
-    PRIMARY KEY (cf_handle, rating)
-
-curve_overrides(cf_handle, rating, minutes, updated_at)
-    PRIMARY KEY (cf_handle, rating)     -- durable ;adjust calibrations
-
-meta(key, value)                        -- problemset cache timestamp etc.
+```env
+CRON_SECRET=some-long-random-value
 ```
 
-`raw_minutes` is `NULL` for ratings with no observations; `;curve` only draws
-the dashed raw line for buckets with `sample_size > 0`.
+and an `Authorization: Bearer <CRON_SECRET>` request header.
+
+Vercel Cron:
+
+```json
+{
+  "crons": [
+    { "path": "/api/cron/poll", "schedule": "* * * * *" }
+  ]
+}
+```
+
+**Plan limits matter:** Vercel Cron on **Hobby runs once per day** and
+per-minute expressions fail deployment; minute-level polling requires **Pro**
+or an external scheduler (cron-job.org, GitHub Actions, etc.). See
+[Vercel Cron usage and pricing](https://vercel.com/docs/cron-jobs/usage-and-pricing).
+
+Without a scheduler, the bot still works: `/status` performs the same check on
+demand. The function runs one poll at a time and is bounded by Vercel's maximum
+duration (300 seconds on Hobby).
 
 ---
 
-## Project layout
+## Redis layout
+
+All keys are prefixed with `ihave:`.
+
+| Key | Type | Contents |
+|---|---|---|
+| `ihave:user:<discord_id>` | JSON string | handle, current rating, last sync |
+| `ihave:handle:<handle>` | string | canonical handle spelling |
+| `ihave:curve:<handle>` | JSON string | 28 rating points |
+| `ihave:overrides:<handle>` | JSON string | durable `/adjust` values |
+| `ihave:solved:<handle>` | set | `contestId:index` pairs |
+| `ihave:problems:<rating>` | JSON string | cached tier |
+| `ihave:problems:recent` | JSON string | top 400 contest ids |
+| `ihave:problems:updated` | string | cache timestamp |
+| `ihave:session:<id>` | JSON string | active session |
+| `ihave:session:user:<id>` | string | current session id |
+| `ihave:sessions:active` | set | active session ids |
+| `ihave:feedback:<id>` | string | one-feedback NX lock |
+
+The problemset is split by rating to keep individual Redis values small.
+
+---
+
+## Vercel specifics and limits
+
+- A deferred Discord response is sent immediately; actual work runs inside
+  `wait_until`. Vercel keeps the invocation alive up to the configured maximum
+  duration (`maxDuration: 300` in [`vercel.json`](vercel.json)). Ensure **Fluid
+  compute** is enabled if post-response work is being cut off early.
+- `/link` and `/sync` fetch up to 10,000 submissions; they can take several
+  seconds because the Codeforces client spaces requests by 2.05 seconds.
+- Vercel Functions have an ephemeral filesystem. Nothing durable is written
+  locally; Redis is required.
+- Vercel Hobby functions have a **300 second** maximum duration; Pro supports
+  longer durations. A full history sync plus chart rendering is normally well
+  inside that.
+- `/curve` renders in a worker thread and uploads the PNG as an attachment edit.
+
+---
+
+## Project structure
 
 ```
-bot.py                 Discord bot: commands, session loop, embeds, buttons
-cf_api.py              Public Codeforces API client + global rate limiter
-estimator.py           Pure numpy estimation engine (no discord / no db)
-storage.py             aiosqlite persistence and problem selection
-plotter.py             Matplotlib PNG chart generator
-requirements.txt       Pinned minimum dependencies
-.env.example           Environment template
-.gitignore             Ignores .env, data/, caches, venv
-tests/test_estimator.py Synthetic unit tests for the estimation engine
-README.md              This file
+main.py                 FastAPI interactions endpoint + slash handlers
+storage.py              Redis/memory storage, curves, sessions, cache
+cf_api.py               Public Codeforces API client + rate limiter
+estimator.py            Pure numpy solve-time estimation
+plotter.py              Matplotlib PNG rendering
+register_commands.py    One-time Discord slash command registration
+vercel.json             Function duration config
+requirements.txt        Python dependencies
+.env.example            Environment template
+tests/test_estimator.py Synthetic estimator tests
+tests/test_serverless.py Signature + memory-storage tests
 ```
 
 ---
 
-## Running the tests
+## Tests
 
 ```bash
 pytest -q
 ```
 
-The tests use only hardcoded synthetic submissions and observations; they make
-no network calls and do not import `storage.py`.
-
-Covered:
-
-1. earliest-AC deduplication, contest deltas (10/20/45 minutes), practice
-   submissions ignored, five-hour cutoff;
-2. monotonic smoothing of a 1600:35 → 1700:55 → 1800:44 dip;
-3. `recommend_rating` for 15, 30, and 60 minutes plus clamp behaviour;
-4. cold-start fallback for 0, 2, and extreme ratings.
+The estimator tests use hardcoded synthetic submissions and never touch Redis,
+Discord or the network.
 
 ---
 
 ## Troubleshooting
 
 | Symptom | Fix |
-| --- | --- |
-| `DISCORD_TOKEN is not set` | Copy `.env.example` to `.env` and paste the token. |
-| `DISCORD_TOKEN is still the placeholder` | Open `.env`, replace `your_discord_bot_token_here` with the real bot token, and save. |
-| Bot ignores `;ihave` | Enable **Message Content Intent** in the Developer Portal; restart the bot. |
-| `RuntimeWarning: coroutine ... was never awaited` | Make sure `bot.run(...)` is the last call and no code after it. |
-| `Codeforces rate limit reached` | Wait a minute. The 2.05s global pacing normally prevents this. |
-| `Codeforces handle ... was not found` | Handles are case-insensitive; check spelling and that the profile exists. |
-| Empty problemset / no problems found | Run `;sync`; the cache may have failed to warm at startup. |
-| Chart missing / font warnings | Matplotlib falls back to DejaVu Sans; no action needed. |
-| First `;ihave` is slow | The problemset cache refresh makes several paced API calls; later runs use SQLite. |
-| Bot restarted mid-session | Sessions are in memory only; run `;ihave` again. |
+|---|---|
+| Endpoint URL won't save / `401` | `DISCORD_PUBLIC_KEY` must be the application's Public Key, not the bot token. |
+| Slash commands missing | Run `register_commands.py`; global commands can take time. Set `GUILD_ID` for instant guild sync. |
+| `Redis is not configured` | Set `UPSTASH_REDIS_REST_URL` + token or `KV_REST_API_URL` + token in Vercel. |
+| `Discord edit failed (404)` | The interaction token expired or the application id is wrong; check logs. |
+| `/ihave` says no problem | The problemset cache may be missing; run `/sync` or retry. |
+| `/status` never sees an AC | Codeforces can lag a few seconds; run `/status` again. Automatic checks require cron. |
+| Function timeout | Hobby is capped at 300s; retry, or upgrade Pro. Check Vercel logs. |
+| Button feedback says already recorded | One adjustment per session is intentional. |
+| Cron endpoint 503 | `CRON_SECRET` is not set. |
+| Cron endpoint 401 | Send `Authorization: Bearer <CRON_SECRET>`. |
 
 ---
 
-## Limitations
+## Security notes
 
-- Active sessions are in memory, so restarting the bot cancels timers.
-- Only the most recent 10,000 submissions are scanned (`user.status` cap).
-- Contest solve deltas approximate "time spent" by the gap between ACs; a user
-  who thinks for 20 minutes before their first accepted submission is measured
-  exactly that way (the first problem includes all pre-solve thinking).
-- `contest.list` is fetched once per cache refresh purely to filter special
-  contests; the bot still works with the built-in denylist if that call fails.
-- Ratings and tags are hidden in embeds as spoilers; anyone can still click the
-  problem link and see the rating on Codeforces.
+- Every interaction is Ed25519-verified against `DISCORD_PUBLIC_KEY`.
+- `/link` proves only that a Codeforces handle **exists**, not that the Discord
+  user owns it. The Codeforces API has no OAuth flow in this project; data is
+  public and read-only.
+- Keep `.env` local. It is ignored by Git; never commit bot tokens or Redis
+  credentials.

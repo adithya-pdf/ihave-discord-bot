@@ -8,7 +8,15 @@ bot so the event loop is never blocked.
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 from typing import Any, Iterable, Mapping
+
+# Serverless filesystems are read-only except for /tmp; keep matplotlib's font
+# cache and config out of the home directory.
+os.environ.setdefault(
+    "MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "ihave-matplotlib")
+)
 
 import matplotlib
 

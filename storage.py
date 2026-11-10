@@ -1,276 +1,324 @@
-"""Async SQLite persistence for the ``;ihave`` bot (aiosqlite only).
+"""Serverless storage for the Vercel interactions bot.
 
-All statements go through ``aiosqlite`` so the Discord event loop never blocks
-on disk I/O. The default database lives in ``data/bot.db``; the directory is
-created automatically before the connection is opened, which keeps fresh
-deployments from failing with ``FileNotFoundError``.
+Production uses an HTTP Redis (Upstash / Vercel KV) because Vercel Functions
+have an ephemeral filesystem and no shared memory. Local development falls back
+to an in-process memory store so the app can run without any cloud services.
 
-Tables
-------
-``problems``       cached ``problemset.problems`` rows (24 hour TTL)
-``users``          Discord id -> Codeforces handle mapping
-``user_solved``    accepted problems per handle (practice submissions included)
-``user_curve``     raw / monotonically smoothed minutes per rating
-``meta``           small key/value cache metadata
-``curve_overrides`` manual ``;adjust`` calibrations that survive ``;sync``
+The module keeps the same domain model as the old SQLite version:
+
+* cached problemset, grouped by rating
+* users (Discord id -> Codeforces handle / rating)
+* solved problems per handle
+* personal curves and durable ``/adjust`` overrides
+* active practice sessions and button feedback idempotency
+
+Redis is accessed through its REST API with ``aiohttp``; no connection pool is
+needed, which is a good fit for serverless invocations.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import random
 import time
+import uuid
 from typing import Any, Iterable, Mapping, Sequence
 
-import aiosqlite
+import aiohttp
 
 import estimator
 
-DEFAULT_DB_PATH = os.path.join("data", "bot.db")
 PROBLEMSET_TTL_SECONDS = 24 * 60 * 60
 RECENT_CONTEST_WINDOW = 400
 TOP_SOLVED_FRACTION = 0.70
+FEEDBACK_TTL_SECONDS = 24 * 60 * 60
+PROBLEMSET_LOCK_SECONDS = 180
 
-_DB: aiosqlite.Connection | None = None
-_DB_PATH = os.getenv("BOT_DB_PATH") or DEFAULT_DB_PATH
-_INIT_LOCK: asyncio.Lock | None = None
-_PROBLEMSET_LOCK: asyncio.Lock | None = None
+_PREFIX = "ihave"
+_ACTIVE_SESSIONS = f"{_PREFIX}:sessions:active"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS problems (
-    contest_id   INTEGER NOT NULL,
-    index_name   TEXT    NOT NULL,
-    name         TEXT    NOT NULL,
-    rating       INTEGER NOT NULL,
-    solved_count INTEGER NOT NULL DEFAULT 0,
-    tags         TEXT    NOT NULL DEFAULT '',
-    PRIMARY KEY (contest_id, index_name)
-);
 
-CREATE INDEX IF NOT EXISTS idx_problems_rating
-    ON problems (rating, contest_id DESC);
-
-CREATE TABLE IF NOT EXISTS users (
-    discord_id     INTEGER PRIMARY KEY,
-    cf_handle      TEXT    NOT NULL,
-    current_rating INTEGER,
-    last_synced    INTEGER
-);
-
-CREATE INDEX IF NOT EXISTS idx_users_handle ON users (cf_handle);
-
-CREATE TABLE IF NOT EXISTS user_solved (
-    cf_handle  TEXT    NOT NULL,
-    contest_id INTEGER NOT NULL,
-    index_name TEXT    NOT NULL,
-    PRIMARY KEY (cf_handle, contest_id, index_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_user_solved_handle ON user_solved (cf_handle);
-
-CREATE TABLE IF NOT EXISTS user_curve (
-    cf_handle        TEXT    NOT NULL,
-    rating           INTEGER NOT NULL,
-    raw_minutes      REAL,
-    smoothed_minutes REAL    NOT NULL,
-    sample_size      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (cf_handle, rating)
-);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS curve_overrides (
-    cf_handle  TEXT    NOT NULL,
-    rating     INTEGER NOT NULL,
-    minutes    REAL    NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (cf_handle, rating)
-);
-"""
+class StorageError(RuntimeError):
+    """Raised when the configured storage backend cannot complete an operation."""
 
 
 # ---------------------------------------------------------------------------
-# Connection management
+# Backends
 # ---------------------------------------------------------------------------
 
 
-def _get_init_lock() -> asyncio.Lock:
-    global _INIT_LOCK
-    if _INIT_LOCK is None:
-        _INIT_LOCK = asyncio.Lock()
-    return _INIT_LOCK
+class _Backend:
+    async def get(self, key: str) -> str | None:
+        raise NotImplementedError
 
+    async def set(self, key: str, value: str) -> None:
+        raise NotImplementedError
 
-def _get_problemset_lock() -> asyncio.Lock:
-    global _PROBLEMSET_LOCK
-    if _PROBLEMSET_LOCK is None:
-        _PROBLEMSET_LOCK = asyncio.Lock()
-    return _PROBLEMSET_LOCK
+    async def delete(self, key: str) -> None:
+        raise NotImplementedError
 
+    async def set_members(self, key: str) -> list[str]:
+        raise NotImplementedError
 
-async def init_db(db_path: str | None = None) -> aiosqlite.Connection:
-    """Open the database (creating ``data/`` and the schema when needed)."""
-    global _DB, _DB_PATH
+    async def set_add(self, key: str, members: Sequence[str]) -> int:
+        raise NotImplementedError
 
-    async with _get_init_lock():
-        if db_path:
-            new_path = str(db_path)
-            if _DB is not None and new_path != _DB_PATH:
-                await _DB.close()
-                _DB = None
-            _DB_PATH = new_path
-        if _DB is not None:
-            return _DB
+    async def set_remove(self, key: str, members: Sequence[str]) -> int:
+        raise NotImplementedError
 
-        # CRITICAL: never let a fresh deployment fail because data/ is missing.
-        os.makedirs("data", exist_ok=True)
-        directory = os.path.dirname(os.path.abspath(_DB_PATH))
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+    async def set_nx(self, key: str, value: str, *, ex: int = 0) -> bool:
+        raise NotImplementedError
 
-        connection = await aiosqlite.connect(_DB_PATH)
-        connection.row_factory = aiosqlite.Row
-        try:
-            await connection.execute("PRAGMA journal_mode=WAL")
-            await connection.execute("PRAGMA synchronous=NORMAL")
-            await connection.execute("PRAGMA foreign_keys=ON")
-            await connection.executescript(_SCHEMA)
-            await connection.commit()
-        except Exception:
-            await connection.close()
-            raise
-        _DB = connection
-        return connection
-
-
-async def get_db() -> aiosqlite.Connection:
-    """Return the live connection, initializing it on first use."""
-    if _DB is None:
-        return await init_db()
-    return _DB
-
-
-async def close_db() -> None:
-    global _DB
-    if _DB is not None:
-        connection, _DB = _DB, None
-        await connection.close()
-
-
-async def _fetchone(sql: str, params: Sequence[Any] = ()) -> aiosqlite.Row | None:
-    database = await get_db()
-    async with database.execute(sql, params) as cursor:
-        return await cursor.fetchone()
-
-
-async def _fetchall(sql: str, params: Sequence[Any] = ()) -> list[aiosqlite.Row]:
-    database = await get_db()
-    async with database.execute(sql, params) as cursor:
-        return list(await cursor.fetchall())
-
-
-# ---------------------------------------------------------------------------
-# Key/value meta
-# ---------------------------------------------------------------------------
-
-
-async def get_meta(key: str, default: str | None = None) -> str | None:
-    row = await _fetchone("SELECT value FROM meta WHERE key = ?", (key,))
-    return row["value"] if row is not None else default
-
-
-async def set_meta(key: str, value: str) -> None:
-    database = await get_db()
-    await database.execute(
-        "INSERT INTO meta (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    await database.commit()
-
-
-# ---------------------------------------------------------------------------
-# Problemset cache
-# ---------------------------------------------------------------------------
-
-
-async def problemset_age_seconds() -> float | None:
-    value = await get_meta("problemset_refreshed_at")
-    if value is None:
-        return None
-    try:
-        return max(0.0, time.time() - float(value))
-    except (TypeError, ValueError):
+    async def close(self) -> None:
         return None
 
 
-async def problem_count() -> int:
-    row = await _fetchone("SELECT COUNT(*) AS count FROM problems")
-    return int(row["count"]) if row is not None else 0
+class MemoryBackend(_Backend):
+    """In-process fallback used by local development and tests.
 
-
-async def replace_problemset(problems: Sequence[dict[str, Any]]) -> int:
-    """Replace the cached problemset in one transaction and stamp the time."""
-    rows = []
-    for problem in problems:
-        rows.append(
-            (
-                int(problem["contest_id"]),
-                str(problem["index_name"]),
-                str(problem["name"]),
-                int(problem["rating"]),
-                int(problem.get("solved_count") or 0),
-                ",".join(str(tag) for tag in (problem.get("tags") or [])),
-            )
-        )
-    if not rows:
-        raise ValueError("Refusing to replace the problemset with zero problems.")
-
-    database = await get_db()
-    try:
-        await database.execute("DELETE FROM problems")
-        await database.executemany(
-            "INSERT OR REPLACE INTO problems "
-            "(contest_id, index_name, name, rating, solved_count, tags) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        await database.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            ("problemset_refreshed_at", str(int(time.time()))),
-        )
-        await database.commit()
-    except Exception:
-        await database.rollback()
-        raise
-    return len(rows)
-
-
-async def ensure_problemset(client: Any, *, force: bool = False) -> bool:
-    """Refresh ``problems`` if the cache is older than 24 hours.
-
-    Returns ``True`` when a refresh happened. A lock prevents two commands from
-    refreshing the same cache concurrently.
+    This is intentionally *not* a Vercel production backend: separate
+    invocations do not share this dictionary.
     """
-    async with _get_problemset_lock():
-        if not force:
-            age = await problemset_age_seconds()
-            count = await problem_count()
-            if age is not None and age < PROBLEMSET_TTL_SECONDS and count > 0:
+
+    def __init__(self) -> None:
+        self._strings: dict[str, str] = {}
+        self._sets: dict[str, set[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> str | None:
+        return self._strings.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        async with self._lock:
+            self._strings[key] = value
+
+    async def delete(self, key: str) -> None:
+        async with self._lock:
+            self._strings.pop(key, None)
+            self._sets.pop(key, None)
+
+    async def set_members(self, key: str) -> list[str]:
+        return sorted(self._sets.get(key, set()))
+
+    async def set_add(self, key: str, members: Sequence[str]) -> int:
+        async with self._lock:
+            current = self._sets.setdefault(key, set())
+            before = len(current)
+            current.update(str(member) for member in members)
+            return len(current) - before
+
+    async def set_remove(self, key: str, members: Sequence[str]) -> int:
+        async with self._lock:
+            current = self._sets.get(key, set())
+            before = len(current)
+            current.difference_update(str(member) for member in members)
+            return before - len(current)
+
+    async def set_nx(self, key: str, value: str, *, ex: int = 0) -> bool:
+        async with self._lock:
+            if key in self._strings:
                 return False
-        problems = await client.get_problemset()
-        await replace_problemset(problems)
-        return True
+            self._strings[key] = value
+            return True
+
+
+class RedisBackend(_Backend):
+    """Upstash/Vercel KV Redis REST backend."""
+
+    def __init__(self, url: str, token: str) -> None:
+        self._url = url.rstrip("/")
+        self._token = token
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _session_or_create(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={"Authorization": f"Bearer {self._token}"},
+            )
+        return self._session
+
+    async def _command(self, *args: Any) -> Any:
+        session = await self._session_or_create()
+        body = [str(arg) for arg in args]
+        try:
+            async with session.post(
+                self._url,
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                text = await response.text()
+                if response.status >= 400:
+                    raise StorageError(
+                        f"Redis returned HTTP {response.status}: {text[:200]}"
+                    )
+        except aiohttp.ClientError as exc:
+            raise StorageError(f"Could not reach Redis: {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise StorageError("Redis request timed out.") from exc
+
+        try:
+            payload = json.loads(text) if text else {}
+        except json.JSONDecodeError as exc:
+            raise StorageError("Redis returned invalid JSON.") from exc
+        if isinstance(payload, dict) and payload.get("error"):
+            raise StorageError(str(payload["error"]))
+        return payload.get("result") if isinstance(payload, dict) else payload
+
+    async def get(self, key: str) -> str | None:
+        result = await self._command("GET", key)
+        return None if result is None else str(result)
+
+    async def set(self, key: str, value: str) -> None:
+        await self._command("SET", key, value)
+
+    async def delete(self, key: str) -> None:
+        await self._command("DEL", key)
+
+    async def set_members(self, key: str) -> list[str]:
+        result = await self._command("SMEMBERS", key)
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise StorageError("Redis SMEMBERS returned an unexpected value.")
+        return [str(member) for member in result]
+
+    async def set_add(self, key: str, members: Sequence[str]) -> int:
+        if not members:
+            return 0
+        result = await self._command("SADD", key, *members)
+        try:
+            return int(result or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_remove(self, key: str, members: Sequence[str]) -> int:
+        if not members:
+            return 0
+        result = await self._command("SREM", key, *members)
+        try:
+            return int(result or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_nx(self, key: str, value: str, *, ex: int = 0) -> bool:
+        args: list[Any] = ["SET", key, value, "NX"]
+        if ex > 0:
+            args.extend(["EX", ex])
+        result = await self._command(*args)
+        return result == "OK"
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+
+_BACKEND: _Backend | None = None
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def get_backend() -> _Backend:
+    """Return the configured backend, preferring Upstash/Vercel KV on Vercel."""
+    global _BACKEND
+    if _BACKEND is not None:
+        return _BACKEND
+
+    url = _first_env("UPSTASH_REDIS_REST_URL", "KV_REST_API_URL")
+    token = _first_env("UPSTASH_REDIS_REST_TOKEN", "KV_REST_API_TOKEN")
+    if url and token:
+        _BACKEND = RedisBackend(url, token)
+        return _BACKEND
+
+    if os.getenv("VERCEL"):
+        raise StorageError(
+            "Redis is not configured. Set UPSTASH_REDIS_REST_URL and "
+            "UPSTASH_REDIS_REST_TOKEN (or Vercel KV's KV_REST_API_URL and "
+            "KV_REST_API_TOKEN) in the Vercel project."
+        )
+
+    _BACKEND = MemoryBackend()
+    return _BACKEND
+
+
+async def close() -> None:
+    global _BACKEND
+    if _BACKEND is not None:
+        await _BACKEND.close()
+        _BACKEND = None
 
 
 # ---------------------------------------------------------------------------
-# Users
+# Keys and JSON helpers
+# ---------------------------------------------------------------------------
+
+
+def _casefold(handle: str) -> str:
+    return str(handle or "").strip().casefold()
+
+
+def _user_key(discord_id: int) -> str:
+    return f"{_PREFIX}:user:{int(discord_id)}"
+
+
+def _handle_key(handle: str) -> str:
+    return f"{_PREFIX}:handle:{_casefold(handle)}"
+
+
+def _curve_key(handle: str) -> str:
+    return f"{_PREFIX}:curve:{_casefold(handle)}"
+
+
+def _overrides_key(handle: str) -> str:
+    return f"{_PREFIX}:overrides:{_casefold(handle)}"
+
+
+def _solved_key(handle: str) -> str:
+    return f"{_PREFIX}:solved:{_casefold(handle)}"
+
+
+def _problems_key(rating: int) -> str:
+    return f"{_PREFIX}:problems:{int(rating)}"
+
+
+def _session_key(session_id: str) -> str:
+    return f"{_PREFIX}:session:{session_id}"
+
+
+def _user_session_key(discord_id: int) -> str:
+    return f"{_PREFIX}:session:user:{int(discord_id)}"
+
+
+_RECENT_CONTESTS_KEY = f"{_PREFIX}:problems:recent"
+_PROBLEMSET_UPDATED_KEY = f"{_PREFIX}:problems:updated"
+_PROBLEMSET_LOCK_KEY = f"{_PREFIX}:problems:lock"
+
+
+async def _get_json(key: str) -> Any:
+    raw = await get_backend().get(key)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise StorageError(f"Stored value for {key!r} is corrupted.") from exc
+
+
+async def _set_json(key: str, value: Any) -> None:
+    await get_backend().set(key, json.dumps(value, separators=(",", ":")))
+
+
+# ---------------------------------------------------------------------------
+# Users and handle index
 # ---------------------------------------------------------------------------
 
 
@@ -280,44 +328,37 @@ async def upsert_user(
     current_rating: int | None,
     last_synced: int | None = None,
 ) -> None:
-    database = await get_db()
-    await database.execute(
-        "INSERT INTO users (discord_id, cf_handle, current_rating, last_synced) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(discord_id) DO UPDATE SET "
-        "cf_handle = excluded.cf_handle, "
-        "current_rating = excluded.current_rating, "
-        "last_synced = excluded.last_synced",
-        (int(discord_id), cf_handle, current_rating, last_synced),
+    user = await get_user(discord_id) or {}
+    user.update(
+        {
+            "discord_id": int(discord_id),
+            "cf_handle": cf_handle,
+            "current_rating": int(current_rating or estimator.DEFAULT_RATING),
+            "last_synced": int(last_synced if last_synced is not None else time.time()),
+        }
     )
-    await database.commit()
+    await _set_json(_user_key(discord_id), user)
+    await remember_handle(cf_handle)
 
 
 async def get_user(discord_id: int) -> dict[str, Any] | None:
-    row = await _fetchone("SELECT * FROM users WHERE discord_id = ?", (int(discord_id),))
-    return dict(row) if row is not None else None
+    data = await _get_json(_user_key(discord_id))
+    return data if isinstance(data, dict) else None
 
 
-async def get_user_by_handle(cf_handle: str) -> dict[str, Any] | None:
-    row = await _fetchone(
-        "SELECT * FROM users WHERE cf_handle = ? LIMIT 1", (cf_handle,)
-    )
-    return dict(row) if row is not None else None
+async def remember_handle(handle: str) -> None:
+    """Case-insensitive handle lookup (also serves as the canonical spelling)."""
+    canonical = str(handle or "").strip()
+    if canonical:
+        await get_backend().set(_handle_key(canonical), canonical)
 
 
 async def resolve_handle(name: str) -> str | None:
-    """Find the canonical spelling of a handle seen by this bot (case-insensitive)."""
     cleaned = str(name or "").strip().lstrip("@")
     if not cleaned:
         return None
-    for table in ("users", "user_curve", "user_solved"):
-        row = await _fetchone(
-            f"SELECT cf_handle FROM {table} WHERE cf_handle = ? COLLATE NOCASE LIMIT 1",
-            (cleaned,),
-        )
-        if row is not None:
-            return str(row["cf_handle"])
-    return None
+    raw = await get_backend().get(_handle_key(cleaned))
+    return str(raw) if raw else None
 
 
 # ---------------------------------------------------------------------------
@@ -325,126 +366,75 @@ async def resolve_handle(name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _solved_member(contest_id: int, index_name: str) -> str:
+    return f"{int(contest_id)}:{str(index_name)}"
+
+
 async def add_solved_many(cf_handle: str, pairs: Iterable[tuple[int, str]]) -> int:
-    """Insert solved problems idempotently; returns the number of new rows."""
-    rows = [(cf_handle, int(contest_id), str(index_name)) for contest_id, index_name in pairs]
-    if not rows:
+    members = [_solved_member(contest_id, index_name) for contest_id, index_name in pairs]
+    if not members:
         return 0
-    database = await get_db()
-    async with database.execute("SELECT COUNT(*) AS count FROM user_solved WHERE cf_handle = ?", (cf_handle,)) as cursor:
-        before_row = await cursor.fetchone()
-    before = int(before_row["count"]) if before_row is not None else 0
-    await database.executemany(
-        "INSERT OR IGNORE INTO user_solved (cf_handle, contest_id, index_name) "
-        "VALUES (?, ?, ?)",
-        rows,
-    )
-    await database.commit()
-    async with database.execute("SELECT COUNT(*) AS count FROM user_solved WHERE cf_handle = ?", (cf_handle,)) as cursor:
-        after_row = await cursor.fetchone()
-    after = int(after_row["count"]) if after_row is not None else 0
-    return max(0, after - before)
+    backend = get_backend()
+    added = 0
+    for start in range(0, len(members), 500):
+        added += await backend.set_add(_solved_key(cf_handle), members[start : start + 500])
+    return added
 
 
 async def mark_solved(cf_handle: str, contest_id: int, index_name: str) -> None:
-    database = await get_db()
-    await database.execute(
-        "INSERT OR IGNORE INTO user_solved (cf_handle, contest_id, index_name) "
-        "VALUES (?, ?, ?)",
-        (cf_handle, int(contest_id), str(index_name)),
+    await get_backend().set_add(
+        _solved_key(cf_handle), [_solved_member(contest_id, index_name)]
     )
-    await database.commit()
+
+
+async def get_solved(cf_handle: str) -> set[str]:
+    return set(await get_backend().set_members(_solved_key(cf_handle)))
 
 
 async def get_solved_count(cf_handle: str) -> int:
-    row = await _fetchone(
-        "SELECT COUNT(*) AS count FROM user_solved WHERE cf_handle = ?", (cf_handle,)
-    )
-    return int(row["count"]) if row is not None else 0
+    return len(await get_backend().set_members(_solved_key(cf_handle)))
 
 
 # ---------------------------------------------------------------------------
-# Curves
+# Curves and overrides
 # ---------------------------------------------------------------------------
 
 
-async def save_curve(cf_handle: str, points: Sequence[estimator.CurvePoint]) -> None:
-    """Upsert a full curve produced by :func:`estimator.build_curve`."""
-    rows = [
-        (
-            cf_handle,
-            int(point.rating),
-            None if point.raw_minutes is None else float(point.raw_minutes),
-            float(point.smoothed_minutes),
-            int(point.sample_size),
-        )
-        for point in points
-    ]
-    database = await get_db()
-    await database.executemany(
-        "INSERT INTO user_curve "
-        "(cf_handle, rating, raw_minutes, smoothed_minutes, sample_size) "
-        "VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(cf_handle, rating) DO UPDATE SET "
-        "raw_minutes = excluded.raw_minutes, "
-        "smoothed_minutes = excluded.smoothed_minutes, "
-        "sample_size = excluded.sample_size",
-        rows,
-    )
-    await database.commit()
-
-
-async def get_curve(cf_handle: str) -> list[dict[str, Any]]:
-    rows = await _fetchall(
-        "SELECT cf_handle, rating, raw_minutes, smoothed_minutes, sample_size "
-        "FROM user_curve WHERE cf_handle = ? ORDER BY rating",
-        (cf_handle,),
-    )
-    return [dict(row) for row in rows]
-
-
-async def get_curve_map(cf_handle: str) -> dict[int, float]:
-    rows = await get_curve(cf_handle)
+def _point_to_dict(point: estimator.CurvePoint | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(point, Mapping):
+        return {
+            "rating": int(point["rating"]),
+            "raw_minutes": point.get("raw_minutes"),
+            "smoothed_minutes": float(point["smoothed_minutes"]),
+            "sample_size": int(point.get("sample_size") or 0),
+        }
     return {
-        int(row["rating"]): float(row["smoothed_minutes"])
-        for row in rows
-        if row["smoothed_minutes"] is not None
+        "rating": int(point.rating),
+        "raw_minutes": point.raw_minutes,
+        "smoothed_minutes": float(point.smoothed_minutes),
+        "sample_size": int(point.sample_size),
     }
 
 
-async def _current_rating(cf_handle: str) -> int:
-    row = await _fetchone(
-        "SELECT current_rating FROM users WHERE cf_handle = ?", (cf_handle,)
-    )
-    if row is None or row["current_rating"] is None:
-        return estimator.DEFAULT_RATING
-    return estimator.normalize_rating(row["current_rating"])
+def _fallback_points(current_rating: int) -> list[dict[str, Any]]:
+    values = estimator.fallback_curve(current_rating)
+    return [
+        {
+            "rating": rating,
+            "raw_minutes": None,
+            "smoothed_minutes": float(values[rating]),
+            "sample_size": 0,
+        }
+        for rating in estimator.RATING_GRID
+    ]
 
 
-def _clamp_curve_minutes(minutes: Any) -> float:
+def _pin_values(values: Mapping[int, float], rating: int, minutes: float) -> dict[int, float]:
+    """Project a non-decreasing curve through one exact point."""
     try:
-        value = float(minutes)
+        target = max(1.0, min(600.0, float(minutes)))
     except (TypeError, ValueError):
-        return 40.0
-    if not math.isfinite(value):
-        return 40.0
-    return max(1.0, min(600.0, value))
-
-
-def _pin_curve_value(
-    values: Mapping[int, float],
-    rating: int,
-    minutes: float,
-) -> dict[int, float]:
-    """Project a non-decreasing curve through one pinned (rating, minutes) point.
-
-    The pinned rating is set exactly to ``minutes``; lower ratings are capped at
-    that value and higher ratings are floored at it. For a non-decreasing input
-    this is the minimal change that preserves monotonicity, so ``;adjust`` and
-    feedback take effect exactly even when the current curve disagrees with the
-    new value.
-    """
-    target = _clamp_curve_minutes(minutes)
+        target = 40.0
     pinned: dict[int, float] = {}
     for curve_rating in estimator.RATING_GRID:
         current = float(values.get(curve_rating, target))
@@ -458,290 +448,363 @@ def _pin_curve_value(
 
 
 def _apply_overrides(
-    values: Mapping[int, float],
-    overrides: Mapping[int, float],
+    values: Mapping[int, float], overrides: Mapping[int, float]
 ) -> dict[int, float]:
     result = {int(rating): float(minutes) for rating, minutes in values.items()}
     for rating in sorted(overrides):
-        result = _pin_curve_value(result, int(rating), float(overrides[rating]))
+        result = _pin_values(result, int(rating), float(overrides[rating]))
     return result
 
 
-async def _write_smoothed_values(
-    cf_handle: str,
-    values: Mapping[int, float],
+async def save_curve(
+    cf_handle: str, points: Sequence[estimator.CurvePoint | Mapping[str, Any]]
 ) -> None:
-    """Persist a full grid of smoothed minutes (raw observations are untouched)."""
-    rows = await get_curve(cf_handle)
-    existing = {int(row["rating"]): row for row in rows}
-    database = await get_db()
-    updates = []
-    inserts = []
-    for rating in estimator.RATING_GRID:
-        value = float(values.get(rating, 40.0))
-        if rating in existing:
-            updates.append((value, cf_handle, rating))
-        else:
-            inserts.append((cf_handle, rating, value))
-
-    if updates:
-        await database.executemany(
-            "UPDATE user_curve SET smoothed_minutes = ? "
-            "WHERE cf_handle = ? AND rating = ?",
-            updates,
-        )
-    if inserts:
-        await database.executemany(
-            "INSERT INTO user_curve "
-            "(cf_handle, rating, raw_minutes, smoothed_minutes, sample_size) "
-            "VALUES (?, ?, NULL, ?, 0)",
-            inserts,
-        )
-    await database.commit()
+    await _set_json(_curve_key(cf_handle), [_point_to_dict(point) for point in points])
 
 
-async def recalculate_smoothed(cf_handle: str) -> None:
-    """Recompute the displayed curve from raw observations plus overrides.
+async def get_curve(cf_handle: str) -> list[dict[str, Any]]:
+    data = await _get_json(_curve_key(cf_handle))
+    if not isinstance(data, list):
+        return []
+    points = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            points.append(
+                {
+                    "rating": int(row["rating"]),
+                    "raw_minutes": (
+                        None if row.get("raw_minutes") is None else float(row["raw_minutes"])
+                    ),
+                    "smoothed_minutes": float(row["smoothed_minutes"]),
+                    "sample_size": int(row.get("sample_size") or 0),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    points.sort(key=lambda row: row["rating"])
+    return points
 
-    Data-driven smoothing uses :func:`estimator.smooth_monotonic`; every
-    ``;adjust`` override is then pinned into the result with
-    :func:`_pin_curve_value`.
-    """
-    rows = await _fetchall(
-        "SELECT rating, raw_minutes, sample_size FROM user_curve WHERE cf_handle = ?",
-        (cf_handle,),
-    )
-    raw: dict[int, float] = {
-        int(row["rating"]): float(row["raw_minutes"])
-        for row in rows
-        if row["raw_minutes"] is not None
+
+async def get_curve_map(cf_handle: str) -> dict[int, float]:
+    return {
+        int(row["rating"]): float(row["smoothed_minutes"])
+        for row in await get_curve(cf_handle)
     }
-    if raw:
-        base = estimator.smooth_monotonic(raw)
-    else:
-        base = estimator.fallback_curve(await _current_rating(cf_handle))
 
-    overrides = await _get_overrides(cf_handle)
-    values = _apply_overrides(base, overrides)
-    await _write_smoothed_values(cf_handle, values)
+
+async def save_overrides(cf_handle: str, overrides: Mapping[int, float]) -> None:
+    await _set_json(
+        _overrides_key(cf_handle),
+        {str(int(rating)): float(minutes) for rating, minutes in overrides.items()},
+    )
+
+
+async def get_overrides(cf_handle: str) -> dict[int, float]:
+    data = await _get_json(_overrides_key(cf_handle))
+    if not isinstance(data, dict):
+        return {}
+    result: dict[int, float] = {}
+    for rating, minutes in data.items():
+        try:
+            result[int(rating)] = float(minutes)
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 async def rebuild_curve(
     cf_handle: str,
-    points: Sequence[estimator.CurvePoint],
+    points: Sequence[estimator.CurvePoint | Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Save a freshly computed curve and re-apply durable ``;adjust`` overrides."""
-    await save_curve(cf_handle, points)
-    overrides = await _get_overrides(cf_handle)
+    """Save a freshly computed curve and re-apply durable ``/adjust`` overrides."""
+    rows = [_point_to_dict(point) for point in points]
+    overrides = await get_overrides(cf_handle)
     if overrides:
-        rows = await get_curve(cf_handle)
-        values = {
-            int(row["rating"]): float(row["smoothed_minutes"])
-            for row in rows
-            if row["smoothed_minutes"] is not None
-        }
-        await _write_smoothed_values(cf_handle, _apply_overrides(values, overrides))
-    return await get_curve(cf_handle)
-
-
-# ---------------------------------------------------------------------------
-# Manual overrides (`;adjust`) and feedback tweaks
-# ---------------------------------------------------------------------------
-
-
-async def _set_override(cf_handle: str, rating: int, minutes: float) -> None:
-    database = await get_db()
-    await database.execute(
-        "INSERT INTO curve_overrides (cf_handle, rating, minutes, updated_at) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(cf_handle, rating) DO UPDATE SET "
-        "minutes = excluded.minutes, updated_at = excluded.updated_at",
-        (cf_handle, int(rating), float(minutes), int(time.time())),
-    )
-    await database.commit()
-
-
-async def _get_overrides(cf_handle: str) -> dict[int, float]:
-    rows = await _fetchall(
-        "SELECT rating, minutes FROM curve_overrides WHERE cf_handle = ? ORDER BY rating",
-        (cf_handle,),
-    )
-    return {int(row["rating"]): float(row["minutes"]) for row in rows}
+        values = {int(row["rating"]): float(row["smoothed_minutes"]) for row in rows}
+        values = _apply_overrides(values, overrides)
+        for row in rows:
+            row["smoothed_minutes"] = float(values[int(row["rating"])])
+    await _set_json(_curve_key(cf_handle), rows)
+    return rows
 
 
 async def adjust_curve(
     cf_handle: str,
     rating: int,
     minutes: float,
+    *,
+    current_rating: int = estimator.DEFAULT_RATING,
 ) -> tuple[float, float]:
-    """Apply a manual calibration (``;adjust <rating> <minutes>``).
-
-    The requested point is pinned exactly (within 1–600 minutes) and the rest of
-    the curve is adjusted minimally to stay non-decreasing. The override is
-    stored separately so ``;sync`` re-applies it to fresh contest data.
-
-    Returns ``(previous_smoothed, new_smoothed)`` for the adjusted rating.
-    """
+    """Pin the curve at ``(rating, minutes)``; return previous and new values."""
     rating = estimator.normalize_rating(rating)
-    minutes = _clamp_curve_minutes(minutes)
+    minutes = max(1.0, min(600.0, float(minutes)))
+    points = await get_curve(cf_handle) or _fallback_points(current_rating)
+    values = {int(row["rating"]): float(row["smoothed_minutes"]) for row in points}
+    previous = float(values.get(rating, minutes))
 
-    rows = await get_curve(cf_handle)
-    if not rows:
-        await recalculate_smoothed(cf_handle)
-        rows = await get_curve(cf_handle)
-    previous = next(
-        (float(row["smoothed_minutes"]) for row in rows if int(row["rating"]) == rating),
-        minutes,
-    )
-
-    await _set_override(cf_handle, rating, minutes)
-    await recalculate_smoothed(cf_handle)
-
-    rows = await get_curve(cf_handle)
-    updated = next(
-        (float(row["smoothed_minutes"]) for row in rows if int(row["rating"]) == rating),
-        minutes,
-    )
-    return previous, updated
+    overrides = await get_overrides(cf_handle)
+    overrides[rating] = minutes
+    values = _apply_overrides(values, overrides)
+    for row in points:
+        row["smoothed_minutes"] = float(values[int(row["rating"])])
+    await _set_json(_curve_key(cf_handle), points)
+    await save_overrides(cf_handle, overrides)
+    return previous, float(values[rating])
 
 
 async def scale_curve_rating(
     cf_handle: str,
     rating: int,
     factor: float,
+    *,
+    current_rating: int = estimator.DEFAULT_RATING,
 ) -> tuple[float, float]:
-    """Apply button feedback to the expected time at one rating.
-
-    The current curve is pinned through ``old * factor``, so the displayed
-    estimate at that rating changes by the requested amount and the curve stays
-    non-decreasing. Feedback is a tuning signal: it is intentionally *not*
-    stored as a durable ``;adjust`` override, so a later ``;sync`` rebuilds from
-    fresh contest history.
-
-    Returns ``(previous_smoothed, new_smoothed)``.
-    """
+    """Apply button feedback to one rating without making the curve non-monotonic."""
     rating = estimator.normalize_rating(rating)
     try:
         factor = float(factor)
     except (TypeError, ValueError):
         factor = 1.0
-    if not math.isfinite(factor):
-        factor = 1.0
     factor = max(0.25, min(4.0, factor))
 
-    rows = await get_curve(cf_handle)
-    if not rows:
-        await recalculate_smoothed(cf_handle)
-        rows = await get_curve(cf_handle)
-
-    values = {
-        int(row["rating"]): float(row["smoothed_minutes"])
-        for row in rows
-        if row["smoothed_minutes"] is not None
-    }
-    if rating not in values:
-        values[rating] = estimator.fallback_curve(await _current_rating(cf_handle)).get(
-            rating, 40.0
-        )
-    previous = float(values[rating])
-    target = _clamp_curve_minutes(previous * factor)
-    updated = _pin_curve_value(values, rating, target)
-    await _write_smoothed_values(cf_handle, updated)
-    return previous, float(updated[rating])
+    points = await get_curve(cf_handle) or _fallback_points(current_rating)
+    values = {int(row["rating"]): float(row["smoothed_minutes"]) for row in points}
+    previous = float(values.get(rating, 40.0))
+    target = max(1.0, min(600.0, previous * factor))
+    values = _pin_values(values, rating, target)
+    for row in points:
+        row["smoothed_minutes"] = float(values[int(row["rating"])])
+    await _set_json(_curve_key(cf_handle), points)
+    return previous, float(values[rating])
 
 
 # ---------------------------------------------------------------------------
-# Problem selection
+# Problemset cache
 # ---------------------------------------------------------------------------
 
 
-async def _candidates_for_rating(cf_handle: str, rating: int) -> list[aiosqlite.Row]:
-    return await _fetchall(
-        "SELECT p.contest_id, p.index_name, p.name, p.rating, p.solved_count, p.tags "
-        "FROM problems AS p "
-        "WHERE p.rating = ? "
-        "  AND p.contest_id IN ("
-        "      SELECT contest_id FROM ("
-        "          SELECT DISTINCT contest_id FROM problems "
-        "          ORDER BY contest_id DESC LIMIT ?"
-        "      )"
-        "  ) "
-        "  AND NOT EXISTS ("
-        "      SELECT 1 FROM user_solved AS s "
-        "      WHERE s.cf_handle = ? "
-        "        AND s.contest_id = p.contest_id "
-        "        AND s.index_name = p.index_name"
-        "  )",
-        (int(rating), RECENT_CONTEST_WINDOW, cf_handle),
-    )
+async def problemset_age_seconds() -> float | None:
+    raw = await get_backend().get(_PROBLEMSET_UPDATED_KEY)
+    if raw is None:
+        return None
+    try:
+        return max(0.0, time.time() - float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+async def ensure_problemset(client: Any, *, force: bool = False) -> bool:
+    """Refresh the cached problemset if it is older than 24 hours.
+
+    The problemset is split into one JSON value per rating so no single Redis
+    value becomes huge. A short NX lock prevents concurrent refreshes.
+    """
+    age = await problemset_age_seconds()
+    recent = await _get_json(_RECENT_CONTESTS_KEY)
+    if (
+        not force
+        and age is not None
+        and age < PROBLEMSET_TTL_SECONDS
+        and isinstance(recent, list)
+    ):
+        return False
+
+    backend = get_backend()
+    if not await backend.set_nx(_PROBLEMSET_LOCK_KEY, "1", ex=PROBLEMSET_LOCK_SECONDS):
+        return False
+
+    try:
+        problems = await client.get_problemset()
+        tiers: dict[int, list[dict[str, Any]]] = {}
+        contest_ids: set[int] = set()
+        for problem in problems:
+            rating = int(problem["rating"])
+            tiers.setdefault(rating, []).append(problem)
+            contest_ids.add(int(problem["contest_id"]))
+
+        for rating, rows in tiers.items():
+            await _set_json(_problems_key(rating), rows)
+        recent_ids = sorted(contest_ids, reverse=True)[:RECENT_CONTEST_WINDOW]
+        await _set_json(_RECENT_CONTESTS_KEY, recent_ids)
+        await backend.set(_PROBLEMSET_UPDATED_KEY, str(int(time.time())))
+        return True
+    finally:
+        await backend.delete(_PROBLEMSET_LOCK_KEY)
+
+
+async def _problem_tier(rating: int) -> list[dict[str, Any]]:
+    data = await _get_json(_problems_key(rating))
+    if not isinstance(data, list):
+        return []
+    return [row for row in data if isinstance(row, dict)]
 
 
 async def find_unsolved_problem(
     cf_handle: str,
     target_rating: int,
 ) -> dict[str, Any] | None:
-    """Pick a random unsolved, recent problem at (or near) ``target_rating``.
-
-    Within the requested tier, the most-solved 70% of problems are preferred so
-    recommendations are well-tested classics rather than obscure outliers.
-    Nearby ratings are tried in expanding order if the exact tier has no
-    eligible problem.
-    """
+    """Pick a random recent unsolved problem at or near the target rating."""
     target_rating = estimator.normalize_rating(target_rating)
+    recent_raw = await _get_json(_RECENT_CONTESTS_KEY)
+    recent = set(int(contest_id) for contest_id in (recent_raw or []))
+    if not recent:
+        return None
+    solved = await get_solved(cf_handle)
+
     for offset in (0, 100, -100, 200, -200, 300, -300, 400, -400, 500, -500):
         rating = target_rating + offset
         if rating < estimator.RATING_MIN or rating > estimator.RATING_MAX:
             continue
-        rows = await _candidates_for_rating(cf_handle, rating)
-        if not rows:
+        candidates = []
+        for row in await _problem_tier(rating):
+            try:
+                contest_id = int(row["contest_id"])
+                index_name = str(row["index_name"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if contest_id not in recent:
+                continue
+            if _solved_member(contest_id, index_name) in solved:
+                continue
+            candidates.append(row)
+        if not candidates:
             continue
 
-        ordered = sorted(
-            rows,
+        candidates.sort(
             key=lambda row: (
-                -(int(row["solved_count"] or 0)),
-                -int(row["contest_id"]),
-                str(row["index_name"]),
-            ),
+                -(int(row.get("solved_count") or 0)),
+                -int(row.get("contest_id") or 0),
+                str(row.get("index_name") or ""),
+            )
         )
-        pool_size = max(1, int(math.ceil(len(ordered) * TOP_SOLVED_FRACTION)))
-        chosen = random.choice(ordered[:pool_size])
+        pool_size = max(1, int(math.ceil(len(candidates) * TOP_SOLVED_FRACTION)))
+        chosen = random.choice(candidates[:pool_size])
         return {
             "contest_id": int(chosen["contest_id"]),
             "index_name": str(chosen["index_name"]),
             "name": str(chosen["name"]),
             "rating": int(chosen["rating"]),
-            "solved_count": int(chosen["solved_count"] or 0),
-            "tags": [tag for tag in str(chosen["tags"] or "").split(",") if tag],
+            "solved_count": int(chosen.get("solved_count") or 0),
+            "tags": [str(tag) for tag in (chosen.get("tags") or [])],
             "requested_rating": target_rating,
         }
     return None
 
 
+# ---------------------------------------------------------------------------
+# Sessions and feedback idempotency
+# ---------------------------------------------------------------------------
+
+
+async def create_session(discord_id: int, **fields: Any) -> dict[str, Any]:
+    old = await get_session_by_user(discord_id)
+    if old is not None:
+        await delete_session(str(old["id"]))
+
+    session_id = uuid.uuid4().hex[:12]
+    session = {
+        "id": session_id,
+        "user_id": int(discord_id),
+        **fields,
+    }
+    await _set_json(_session_key(session_id), session)
+    await get_backend().set(_user_session_key(discord_id), session_id)
+    await get_backend().set_add(_ACTIVE_SESSIONS, [session_id])
+    return session
+
+
+async def get_session(session_id: str) -> dict[str, Any] | None:
+    data = await _get_json(_session_key(session_id))
+    return data if isinstance(data, dict) else None
+
+
+async def get_session_by_user(discord_id: int) -> dict[str, Any] | None:
+    session_id = await get_backend().get(_user_session_key(discord_id))
+    if not session_id:
+        return None
+    session = await get_session(str(session_id))
+    if session is None:
+        await get_backend().delete(_user_session_key(discord_id))
+        await get_backend().set_remove(_ACTIVE_SESSIONS, [str(session_id)])
+        return None
+    return session
+
+
+async def update_session(session: Mapping[str, Any]) -> None:
+    if "id" not in session:
+        raise StorageError("Session is missing its id.")
+    await _set_json(_session_key(str(session["id"])), dict(session))
+
+
+async def delete_session(session_id: str) -> None:
+    session = await get_session(session_id)
+    backend = get_backend()
+    await backend.delete(_session_key(session_id))
+    await backend.set_remove(_ACTIVE_SESSIONS, [session_id])
+    if session is not None:
+        user_key = _user_session_key(int(session.get("user_id") or 0))
+        if await backend.get(user_key) == session_id:
+            await backend.delete(user_key)
+
+
+async def remove_from_active(session_id: str) -> None:
+    await get_backend().set_remove(_ACTIVE_SESSIONS, [session_id])
+
+
+async def list_active_sessions() -> list[dict[str, Any]]:
+    session_ids = await get_backend().set_members(_ACTIVE_SESSIONS)
+    sessions: list[dict[str, Any]] = []
+    for session_id in session_ids:
+        session = await get_session(session_id)
+        if session is None:
+            await get_backend().set_remove(_ACTIVE_SESSIONS, [session_id])
+            continue
+        sessions.append(session)
+    return sessions
+
+
+async def claim_feedback(session_id: str) -> bool:
+    """Atomically allow one feedback adjustment per session."""
+    return await get_backend().set_nx(
+        f"{_PREFIX}:feedback:{session_id}", "1", ex=FEEDBACK_TTL_SECONDS
+    )
+
+
+async def release_feedback(session_id: str) -> None:
+    await get_backend().delete(f"{_PREFIX}:feedback:{session_id}")
+
+
 __all__ = [
     "PROBLEMSET_TTL_SECONDS",
+    "StorageError",
     "add_solved_many",
     "adjust_curve",
-    "close_db",
+    "claim_feedback",
+    "close",
+    "create_session",
+    "delete_session",
     "ensure_problemset",
     "find_unsolved_problem",
     "get_curve",
     "get_curve_map",
-    "get_db",
-    "get_meta",
+    "get_overrides",
+    "get_session",
+    "get_session_by_user",
+    "get_solved",
     "get_solved_count",
     "get_user",
-    "get_user_by_handle",
-    "init_db",
+    "list_active_sessions",
     "mark_solved",
-    "problem_count",
-    "problemset_age_seconds",
     "rebuild_curve",
-    "recalculate_smoothed",
-    "replace_problemset",
+    "release_feedback",
+    "remember_handle",
+    "remove_from_active",
     "resolve_handle",
     "save_curve",
+    "save_overrides",
     "scale_curve_rating",
-    "set_meta",
+    "update_session",
     "upsert_user",
 ]
