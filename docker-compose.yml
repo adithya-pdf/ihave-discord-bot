@@ -1,0 +1,23 @@
+services:
+  ihave:
+    build: .
+    image: ihave-bot:latest
+    container_name: ihave-bot
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      BOT_DATA_DIR: /app/data
+    volumes:
+      # Named volume keeps the SQLite database, its WAL files and .cache/
+      # writable by the non-root appuser (UID 1000) inside the container.
+      - bot_data:/app/data
+
+      # Alternative bind mount for host-owned data. Uncomment both lines and
+      # make sure ./data is owned by UID 1000:
+      #   mkdir -p ./data && sudo chown -R 1000:1000 ./data
+      # user: "${UID:-1000}:${GID:-1000}"
+      # - ./data:/app/data
+    stop_grace_period: 30s
+
+volumes:
+  bot_data:

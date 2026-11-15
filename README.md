@@ -1,52 +1,51 @@
-# `;ihave` — Codeforces time-boxed practice bot
+# IhHave — Codeforces Rating-Space Elo-Survival practice bot
 
-A single-process, asynchronous Discord bot that answers one question:
+A single-process Discord bot that answers one question:
 
-> *"I have 30 minutes. Which Codeforces problem should I solve right now?"*
+> *"I have 25 minutes. Which Codeforces problem should I solve right now?"*
 
-You link your Codeforces handle, the bot learns how many minutes you typically
-spend on each problem rating from your **live and virtual contest history**, and
-then serves a recent, unsolved problem at the rating your personal speed curve
-says fits your time budget. Problem tags stay hidden so the rating label does
-not spoil the approach.
+You link a Codeforces handle. The bot bootstraps a survival model from your rated
+contest history, then predicts the problem rating you can solve in a given time
+window. It serves a matching unsolved problem, follows the attempt (early solve,
+overtime solve, or right-censored give-up), and refits the model after every
+attempt. It can also run the model backwards (`/times`) to show the minutes you
+need at 50%, 65% and 80% confidence for any rating.
 
-No web backend, no external database server, no Docker, no ML libraries — just
-`discord.py`, `aiohttp`, `matplotlib`, `numpy`, and a local SQLite file
-accessed through `aiosqlite`.
+No web backend, no external database server, no ML libraries and no numerical
+stack: the model and data layer are pure standard-library Python plus SQLite.
 
 ---
 
 ## Features
 
-- **`;link <handle>`** — validates the handle with the public Codeforces API,
-  syncs submissions, and builds the initial time-per-rating curve.
-- **`;ihave <minutes> [rating]`** — 5 to 180 minute practice session. Picks a
-  random recent unsolved problem, hides the rating in a Discord spoiler and
-  hides tags entirely, then polls Codeforces every 60 seconds for an Accepted
-  submission.
-- **`;adjust <rating> <minutes>`** — manual calibration ("I can consistently
-  solve 1700s in 30 minutes"), persisted as an override and re-applied after
-  every `;sync`.
-- **`;curve [handle]`** — renders a clean Matplotlib chart (minutes vs rating)
-  and posts a smoothed per-rating table next to it.
-- **`;status`** — active session, remaining time, and target problem.
-- **`;giveup`** — ends the session and reveals the rating and tags inside
-  Discord spoiler tags (`||graphs, dp||`).
-- **`;sync`** — refreshes submissions, rebuilds the curve, and refreshes the
-  local problemset cache if it is older than 24 hours.
-- **Interactive feedback** — `⚡ Too Easy` / `😅 Too Hard` buttons adjust the
-  expected time for that rating by −15% / +20% while keeping the curve
-  non-decreasing.
+- **`/link <handle>`** — validates the handle, bootstraps from your most recent
+  40 live and virtual participation sessions (clean sequential solve times and
+  end-of-contest timeouts), caches every accepted problem, and fits the initial
+  model.
+- **`/practice <minutes> [confidence] [topic] [blind]`** — 5–180 minute session.
+  Picks a random unsolved problem near your predicted rating. Blind mode adds a
+  `[-100, 0, +100]` rating jitter and spoiler-tags the rating, effective rating
+  and archetype. Timer expiry does **not** fail the session.
+- **Interactive controls** — **Check AC Now**, **Give Up** (with an early
+  confirmation prompt), and **Ignore**. An overtime AC still counts as an exact
+  solve; a give-up is logged as a right-censored observation.
+- **`/times`** — rating → time quantiles. A 13-row rating ladder around your S30
+  at 50% / 65% / 80% confidence plus `P(<=25m)` and `P(<=40m)`, or a single
+  rating deep dive across all five archetypes.
+- **`/perf` (alias `/stats`)** — live-contest readiness, era discount, learned
+  contest offset, timer-budget table and archetype handicaps.
+- **`/calibration`** — walk-forward log-loss, Brier score and a 10-bin
+  reliability table on your own attempts.
+- **`/done`, `/giveup`, `/cancel`** — manual control over the active session.
+- Legacy prefix commands (`;link`, `;practice`/`;ihave`, `;done`, `;giveup`,
+  `;cancel`, `;perf`/`;stats`, `;times`, `;calibration`) remain available.
 
 ---
 
-## Requirements
+## Quick start (local)
 
-- Python **3.12**
-- A Discord application/bot token
-- Internet access to `codeforces.com` (no API key or OAuth needed)
-
-Install dependencies:
+Requirements: Python **3.10+** (tested on 3.12), a Discord bot token, and
+outbound access to `codeforces.com`.
 
 ```bash
 python -m venv .venv
@@ -56,62 +55,42 @@ python -m venv .venv
 # Linux/macOS
 source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # runtime deps + pytest
+cp .env.example .env                  # then paste your token
+python bot.py
 ```
+
+The bot creates the SQLite database on first start and opens the problemset
+cache under `{BOT_DATA_DIR}/.cache/`.
+
+### Discord application setup
+
+1. Create an application at the
+   [Discord Developer Portal](https://discord.com/developers/applications).
+2. **Bot → Add Bot**, then copy the token.
+3. Under **Privileged Gateway Intents**, enable **Message Content Intent**.
+   It is required because this bot still ships prefix commands. (Slash commands
+   do not need it; the legacy `;` commands do.)
+4. Invite the bot with the `bot` and `applications.commands` scopes and the
+   permissions **View Channels**, **Send Messages**, **Embed Links**, and
+   **Read Message History**.
+
+Slash commands are synced automatically on startup (`setup_hook`).
 
 ---
 
-## Discord bot setup
-
-1. Open the [Discord Developer Portal](https://discord.com/developers/applications)
-   and create a new application.
-2. Go to **Bot** → **Add Bot**.
-3. Under **Privileged Gateway Intents**, enable **Message Content Intent**.
-   Prefix commands cannot read `;ihave 30` without it.
-4. Copy the bot token.
-5. Invite the bot with the `bot` scope and these permissions:
-   **View Channels**, **Send Messages**, **Embed Links**, **Attach Files**,
-   **Read Message History**.
-
-   Replace `YOUR_APP_ID` in this URL:
-
-   ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=117760&scope=bot
-   ```
-
-6. Configure the environment:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   `.env`:
-
-   ```env
-   DISCORD_TOKEN=your_real_token_here
-   DEFAULT_CF_HANDLE=
-   ```
-
-   `DEFAULT_CF_HANDLE` is optional. When set, `;link` can be used without an
-   argument and `;curve` falls back to that handle.
-
-7. Run the bot:
-
-   ```bash
-   python bot.py
-   ```
-
-   The bot creates `data/bot.db` on first start and warms the problemset cache
-   in the background (a few seconds; the public API is intentionally paced).
-
-Optional environment variables:
+## Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | — | Bot token (required). |
-| `DEFAULT_CF_HANDLE` | empty | Fallback handle for `;link` / `;curve`. |
-| `BOT_DB_PATH` | `data/bot.db` | Alternative SQLite path (directory is created). |
+| `DEFAULT_CF_HANDLE` | empty | Optional fallback handle for the prefix `;link` command. |
+| `BOT_DATA_DIR` | `.` | Directory for the SQLite database and `.cache/`. Docker sets `/app/data`. |
+| `BOT_DB_PATH` | unset | Legacy override for the exact SQLite file path. Takes precedence over `BOT_DATA_DIR`. |
 | `LOG_LEVEL` | `INFO` | Python log level. |
+
+The bot never reads a token from a command-line argument and never bakes one
+into the image. Docker deployment uses `env_file: .env`.
 
 ---
 
@@ -119,285 +98,313 @@ Optional environment variables:
 
 | Command | Example | Description |
 | --- | --- | --- |
-| `;link` | `;link tourist` | Link a handle, sync submissions, build the curve. |
-| `;ihave` | `;ihave 30` or `;ihave 45 1700` | Start a session for 5–180 minutes, optionally forcing a rating. |
-| `;adjust` | `;adjust 1700 30` | Record "1700 in 30 minutes" and re-smooth the curve. |
-| `;curve` | `;curve` or `;curve tourist` | Post the chart and the smoothed rating table. |
-| `;status` | `;status` | Show the active session and countdown. |
-| `;giveup` | `;giveup` | Cancel and reveal rating + tags in spoilers. |
-| `;sync` | `;sync` | Refresh submissions, curve, and problemset cache. |
-| `;help` | `;help` | Command reference. |
+| `/link` | `/link tourist` | Link a handle and bootstrap the model from contest history. Re-linking a different handle clears the old contest cache first. |
+| `/practice` | `/practice 25 confidence:0.65 topic:DP blind:true` | Start a time-boxed session. `topic` accepts Ad-Hoc, Math, DS, Graphs, DP or Weakest. |
+| `/done` | `/done 21.5 was:2` | Log the active session as solved. Defaults come from one final poll. |
+| `/giveup` | `/giveup 18` | Final poll, then log a right-censored timeout (defaults to elapsed time). |
+| `/cancel` | `/cancel` | Discard the session and log nothing. |
+| `/perf` / `/stats` | `/perf` | Readiness, era discount, time-budget table, archetype handicaps, contest offset. |
+| `/times` | `/times 1900 topic:DP era:Classic mode:Contest` | Time needed at 50/65/80% confidence; omit `rating` for the 13-row ladder. |
+| `/calibration` | `/calibration` | Walk-forward log-loss/Brier/reliability on your practice attempts. |
+| `/help` | `/help` | Command reference. |
 
-`;link` also sends the one-time virtual-contest tip:
+Buttons on a practice message:
 
-> Make sure to register for Virtual Contests before starting them! Unregistered
-> practice submissions are ignored by the time-curve to keep your data accurate.
+- **Check AC Now** — one incremental poll (10 s per-user cooldown); if an AC is
+  found the attempt is finalized publicly in the channel.
+- **Give Up** — asks for confirmation if less than 20% of the budget has
+  elapsed; otherwise does one final poll before logging the timeout.
+- **Ignore** — deletes the session without logging an attempt.
 
 ---
 
-## How the estimation algorithm works
+## How the model works (plain English)
 
-Everything below lives in [`estimator.py`](estimator.py) and is pure logic
-(numpy only), which is why it can be unit tested without Discord, SQLite, or
-network access.
+Each user is summarised by eight interpretable parameters (all in Codeforces
+rating points unless noted):
 
-### 1. Contest submissions only
-
-From `user.status` we keep submissions where:
-
-- `verdict == "OK"`
-- `author.participantType` is `CONTESTANT` or `VIRTUAL`
-- the problem has a `rating`
-- `0 < relativeTimeSeconds <= 18000` (five hours)
-
-Practice submissions are deliberately ignored: unregistered practice says
-nothing reliable about contest speed.
-
-### 2. Per-contest time deltas
-
-Accepted submissions are grouped by
-`(contestId, participantType, author.startTimeSeconds)` — so a virtual restart
-is its own participation. Within a participation:
-
-- keep only the **earliest** AC per `problem.index`;
-- sort the solved problems by `relativeTimeSeconds`:
-  `t1 <= t2 <= ... <= tk`;
-- the time spent on each problem is
-
-  ```
-  Δ1 = t1 / 60
-  Δi = (ti - t(i-1)) / 60
-  ```
-
-`relativeTimeSeconds` is already relative to contest start, so no external start
-timestamp is subtracted.
-
-### 3. Recency filter
-
-Only the **35 most recent distinct contest participations** feed the curve.
-Recency is ordered by contest id (which grows over time) and participation start
-time, so a user's current speed dominates the estimate.
-
-### 4. Robust aggregation
-
-Δ values are bucketed by rating on the 800…3500 / step-100 grid. A bucket needs
-at least **2** solves to produce a raw average. Buckets with 4+ solves use a 10%
-trimmed mean (at least one value trimmed from each end); tiny buckets use the
-median. This keeps a single 3-minute fluke from defining a rating.
-
-### 5. Monotonic smoothing (numpy only, no scikit-learn)
-
-Higher ratings can show *lower* raw averages because of survivorship bias: in a
-two-hour contest only the easy problems of the highest ratings get solved at
-all. To remove those impossible dips:
-
-1. `numpy.interp` fills missing rating buckets by linear interpolation between
-   observed buckets (and clamps beyond the observed range).
-2. `numpy.maximum.accumulate` performs a forward cumulative maximum, making the
-   final curve non-decreasing in rating.
-
-Raw averages are retained separately for the dashed line on the chart.
-
-### 6. Cold start
-
-If the user has **fewer than 5 rated contests** (or no usable buckets), the
-curve is anchored around their current rating `R` (1500 if unrated):
-
-| Rating | Minutes |
+| Parameter | Meaning |
 | --- | --- |
-| `R - 300` | 12 |
-| `R - 200` | 18 |
-| `R - 100` | 28 |
-| `R` | 40 |
-| `R + 100` | 55 |
-| `R + 200` | 75 |
+| `s30` | The rating you solve with 50% probability in 30 minutes on a **modern** problem. |
+| `gamma` | Era discount: how many points easier a problem older than 7.5 years feels than a modern problem of the same nominal rating. |
+| `delta[0..4]` | Per-archetype handicap. Positive means you are slower/weaker than your rating suggests on that topic; negative means faster/stronger. |
+| `contest_offset` | Extra effective difficulty of a live-contest solve versus relaxed practice. Positive means you are slower in contests. |
+| `kappa` | Time → rating exchange rate (rating points per unit of log-time; 180 ≈ 125 points per doubling). |
+| `k` | Log-logistic consistency shape (default 2.5). |
 
-The anchors are interpolated onto the grid, extrapolated for very low/high
-ratings, clamped to 3–240 minutes, and made non-decreasing.
+For an attempt at nominal rating `R` with elapsed time `t`, the model computes
 
-### 7. Reverse lookup for `;ihave`
-
-Given `target_minutes`:
-
-1. Pick the **highest** rating whose smoothed time is
-   `<= target_minutes * 1.08`.
-2. If every rating is too slow, pick the bucket closest to the target by
-   absolute difference.
-3. Clamp to `[max(800, current_rating - 500), current_rating + 300]`, snap to
-   the 100-point grid.
-
-The 8% tolerance prevents a 29.9-minute curve value from being rejected for a
-30-minute request.
-
-### 8. Problem selection
-
-From the local `problems` cache:
-
-- only the **400 highest contest ids** (recent problems);
-- only the requested rating (adjacent tiers are tried if the exact tier has no
-  eligible problem);
-- excluding every problem present in `user_solved` — including practice solves;
-- prefer the **top 70% by `solved_count`** within the tier, then pick uniformly
-  at random from that pool.
-
-### 9. Session tracking
-
-`;ihave` performs a quick 25-submission sync first, records the ids of those
-submissions, then polls `user.status` every 60 seconds. A submission counts as
-the session win when it is a new id, has verdict `OK`, and matches the target
-`contestId` + `index`. Elapsed time comes from the submission's
-`creationTimeSeconds`.
-
-Sessions live in memory only; a bot restart forgets active timers (documented
-limitation).
-
-### 10. Feedback buttons
-
-- `⚡ Too Easy` targets `old_minutes * 0.85` (−15%).
-- `😅 Too Hard` targets `old_minutes * 1.20` (+20%).
-
-The bot then **pins** the smoothed curve through that exact point: ratings at or
-below it are capped at the new value, ratings above it are floored at the new
-value. For a non-decreasing curve this is the minimal change that keeps the
-curve monotonic, so the requested adjustment is actually visible at that rating
-instead of being swallowed by a forward-maximum pass. Both buttons are disabled
-after one adjustment per session to prevent accidental stacking.
-
-Button tweaks are tuning signals, not permanent calibration: they update
-`smoothed_minutes` but not `curve_overrides`, so a later `;sync` rebuilds from
-fresh contest history. Use `;adjust` for a durable override.
-
-### 11. Manual calibration and monotonic projection
-
-`;adjust 1700 30` records the point in `curve_overrides` and pins the curve
-through `(1700, 30)`. On every subsequent `;sync`, the fresh contest-derived
-curve is recomputed and all stored overrides are pinned into it in ascending
-rating order. This makes manual calibration survive data refreshes while the
-result remains non-decreasing: if you say you solve 1700s in 30 minutes, slower
-neighbouring buckets are pulled down (or faster neighbours pushed up) just
-enough to keep the curve consistent.
-
----
-
-## Codeforces API, caching, and rate limiting
-
-`cf_api.py` uses only public endpoints:
-
-| Endpoint | Use |
-| --- | --- |
-| `problemset.problems` | Problem metadata + solved counts, cached for 24h. |
-| `user.info` | Handle validation, canonical spelling, current rating. |
-| `user.status` | Submission history, quick sync, session polling. |
-| `contest.list` | Only to identify April Fools / Kotlin Heroes contests by name. Falls back to a curated denylist if unavailable. |
-
-**Rate limiting:** a module-level singleton `asyncio.Lock` serializes every
-request from the whole process — command handlers, cache refresh, and all
-background pollers. Inside the lock the client sleeps until at least **2.05
-seconds** have passed since the previous request started, then timestamps the
-new request. This keeps the bot far below Codeforces' public call limit.
-
-**Retries:** network timeouts/connection errors, HTTP 429, and HTTP 5xx are
-retried up to 4 times with exponential backoff (3s, 6s, 12s, longer on 429).
-Every attempt has a 30-second timeout. API-level failures (unknown handle, bad
-request) raise `CFError` with a human-friendly message that the bot posts
-directly.
-
-**Special contests:** problems without a rating are dropped, as are all
-problems from contests whose name contains "April Fools", "Kotlin Heroes", or
-"Kotlin", plus a known-id denylist as a fallback.
-
----
-
-## Database
-
-SQLite lives at `data/bot.db` (auto-created with `os.makedirs("data",
-exist_ok=True)`). All access uses `aiosqlite`; WAL mode is enabled.
-
-```
-problems(contest_id, index_name, name, rating, solved_count, tags)
-    PRIMARY KEY (contest_id, index_name)
-
-users(discord_id, cf_handle, current_rating, last_synced)
-    PRIMARY KEY (discord_id)
-
-user_solved(cf_handle, contest_id, index_name)
-    PRIMARY KEY (cf_handle, contest_id, index_name)
-
-user_curve(cf_handle, rating, raw_minutes, smoothed_minutes, sample_size)
-    PRIMARY KEY (cf_handle, rating)
-
-curve_overrides(cf_handle, rating, minutes, updated_at)
-    PRIMARY KEY (cf_handle, rating)     -- durable ;adjust calibrations
-
-meta(key, value)                        -- problemset cache timestamp etc.
+```text
+r_eff = R - gamma * era_factor + mean(delta[archetype]) + contest_offset * is_contest
+z     = k * ln(t / 30) + (k / kappa) * (s30 - r_eff)
+p     = sigmoid(z)
 ```
 
-`raw_minutes` is `NULL` for ratings with no observations; `;curve` only draws
-the dashed raw line for buckets with `sample_size > 0`.
+A solve contributes a log-logistic density and a give-up contributes a
+right-censored survival term. Elapsed time already includes time lost to wrong
+answers, so fitting adds **zero** minutes per WA (`FIT_WA_PENALTY_MINS = 0`);
+the `+5m per WA` "contest-equivalent time" is display-only.
+
+The eight rating-space parameters enter linearly, so the weighted likelihood is
+concave. Gaussian priors (`s30 ±150`, `gamma ~ N(200, 75)`, `delta ~ N(0, 60)`,
+`contest_offset ~ N(0, 50)`) make the log-posterior strictly concave. The bot
+finds the unique MAP estimate with Newton's method (Gaussian elimination,
+partial pivoting, step clipping and a backtracking line search) and reports
+standard errors from the inverse Hessian. Observations decay with a 75-day
+half-life (floor 5%), and contest-derived rows carry a 0.7 bootstrap weight.
+
+**Cold start.** `/link` reads `user.rating`, `contest.list` and the problemset
+first, then makes one paged pass over `user.status` (1000 rows per page, no date
+cutoff, capped at 20,000 submissions). Inside that pass it caches every AC in
+`cf_solved` and keeps live (`CONTESTANT`) and virtual (`VIRTUAL`) participation
+submissions from the 40 most recent participation sessions. The pure
+bootstrapper reconstructs clean sequential solve times
+(`actual = this AC - previous AC`) and one end-of-contest right-censored timeout
+when all post-last-AC attempts target a single unsolved problem. Virtual
+sessions ignore problems already solved before the virtual started, use the
+virtual play time for `occurred_at` (recency decay), and keep the official
+contest date for `contest_start_ts` (era discounting). Incremental polls use a
+15-minute overlap so a `TESTING` submission that turns `OK` after the cursor
+advanced is not missed.
+
+**Backtest.** `/calibration` refits on each attempt's preceding history (most
+recent 300 records), predicts `P(solve <= budget)` out of sample, and reports
+log-loss (vs. the 0.6931 coin-flip baseline), Brier score and 10 reliability
+bins.
+
+---
+
+## Data, memory and threading
+
+- **SQLite** lives at `{BOT_DATA_DIR}/bot.db` (Docker: `/app/data/bot.db`), in
+  WAL mode, with one connection guarded by a `threading.Lock`. `PRAGMA
+  user_version` tracks migrations; a pre-survival `data/bot.db` schema is
+  detected and migrated by dropping the old tables. `bot.close()` closes the
+  connection cleanly.
+- **Problemset cache** — `{BOT_DATA_DIR}/.cache/problemset_compact.json` is a
+  compact `[contestId, index, name, rating, tags]` list written immediately
+  after parsing. A 24-hour TTL applies; corrupt files are refetched; a stale
+  file is used with a warning if the API is down. Restarts never parse the
+  bulky raw Codeforces response.
+- **Submission paging** — `user.status` is consumed one page at a time and
+  reduced to compact tuples before the next page is requested, so at most one
+  raw JSON page is alive at once.
+- **`/link` concurrency** — a process-wide `asyncio.Semaphore(1)` serialises
+  `/link` scans so two concurrent calls cannot multiply peak memory.
+- **Codeforces rate limit** — one process-wide `threading.Lock` +
+  `time.monotonic` limiter enforces at least 2.05 s between *any* two requests,
+  shared by `/link`, the poller and button handlers. Transient HTTP 429/5xx,
+  network errors and JSON `{"status":"FAILED", "comment":"... limit exceeded"}`
+  responses are retried with exponential backoff and jitter (max 5 tries).
+- **Discord memory** — `Intents.default()` with `members=False`,
+  `presences=False` and `message_content=True` (prefix commands),
+  `MemberCacheFlags.none()`, `chunk_guilds_at_startup=False` and
+  `max_messages=None`.
+- **Event loop** — every Codeforces call and every `CFPredictor.fit()` /
+  `walk_forward_backtest()` invocation from `bot.py` runs inside
+  `asyncio.to_thread`. SQLite reads are local and sub-millisecond.
+
+---
+
+## Docker deployment (Hetzner VPS)
+
+### 1. Create the server
+
+A small Hetzner Cloud CX22 (2 vCPU / 4 GB) running Ubuntu 24.04 is plenty. Only
+SSH needs to be reachable; the bot makes outbound HTTPS connections to Discord
+and Codeforces.
+
+```bash
+ssh root@YOUR_SERVER_IP
+curl -fsSL https://get.docker.com | sh
+```
+
+### 2. Get the project and configure it
+
+```bash
+git clone <your-repository-url> ihave
+cd ihave
+cp .env.example .env
+nano .env             # DISCORD_TOKEN=..., optionally DEFAULT_CF_HANDLE=...
+```
+
+Never commit `.env`; it is excluded by `.gitignore` and `.dockerignore`.
+
+### 3. Start it
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
+
+The container runs as non-root `appuser` (UID 1000). `BOT_DATA_DIR=/app/data` is
+backed by the named volume `bot_data`, so the SQLite database, its `-wal`/`-shm`
+files and `.cache/` survive restarts and upgrades.
+
+Common operations:
+
+```bash
+docker compose restart          # or: docker compose up -d --build after a pull
+docker compose down             # keeps the bot_data volume
+docker compose ps
+docker compose logs --tail=200
+```
+
+### 4. Backups
+
+Stop the bot briefly or use a volume snapshot, then archive the volume:
+
+```bash
+docker compose stop
+docker run --rm -v ihave_bot_data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/ihave-backup.tgz -C /data .
+docker compose start
+```
+
+To use a host bind mount instead of the named volume, uncomment the
+`user: "${UID:-1000}:${GID:-1000}"` and `./data:/app/data` lines in
+`docker-compose.yml`, create the directory, and make it writable by UID 1000:
+
+```bash
+mkdir -p ./data && sudo chown -R 1000:1000 ./data
+```
+
+Both options keep SQLite WAL files writable for the non-root container user.
+
+---
+
+## Systemd user service (no Docker / no root)
+
+When Docker is unavailable but the account can run a user-level systemd service,
+this is the smallest production-grade setup. It also survives logout and reboots
+once lingering is enabled.
+
+```bash
+cd ~/ihave-bot
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+mkdir -p data
+
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/ihave.service <<'UNIT'
+[Unit]
+Description=IhHave Codeforces Discord Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ihave-bot
+Environment=BOT_DATA_DIR=%h/ihave-bot/data
+Environment=LOG_LEVEL=INFO
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/ihave-bot/.venv/bin/python %h/ihave-bot/bot.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+SyslogIdentifier=ihave-bot
+
+[Install]
+WantedBy=default.target
+UNIT
+
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now ihave.service
+```
+
+Manage and inspect it without root:
+
+```bash
+systemctl --user status ihave.service
+systemctl --user restart ihave.service
+journalctl --user -u ihave.service -f
+```
+
+`loginctl enable-linger "$USER"` is what makes the user manager (and the bot)
+start after a reboot. If that command is denied on a hardened host, the same unit
+can be installed system-wide as `/etc/systemd/system/ihave.service` with
+`User=deploy` and `WorkingDirectory=/home/deploy/ihave-bot`.
+
+---
+
+## Database location
+
+| Context | Path |
+| --- | --- |
+| Local default | `./bot.db` (because `BOT_DATA_DIR` defaults to `.`) |
+| Docker | `/app/data/bot.db` (named volume `bot_data`) |
+| Legacy override | `$BOT_DB_PATH` if set |
+
+The compact caches live next to it in `{BOT_DATA_DIR}/.cache/`:
+`problemset_compact.json` (24 h TTL) and `contests_compact.json` (24 h TTL).
+
+---
+
+## Testing
+
+The unit tests are fully offline: synthetic data only, no Codeforces calls and
+no Discord connection.
+
+```bash
+# Windows
+.venv\Scripts\python -m pytest -q
+# Linux/macOS
+.venv/bin/python -m pytest -q
+```
+
+Eighteen tests across three files:
+
+- `tests/test_predictor.py` — tag/era mapping, overtime vs. fast solves,
+  right-censored timeouts, era discount, archetype divergence, decay weights,
+  analytic gradient/Hessian vs. finite differences, determinism and standard
+  errors, WA non-double-counting, contest-offset learning, walk-forward
+  backtest, exact rating↔time inverses, duration formatting.
+- `tests/test_db.py` — practice re-attempts, bootstrap idempotency, atomic
+  `complete_session`, `occurred_at` → `days_ago`, incremental `cf_solved` and
+  solved-key union.
+- `tests/test_cf_data.py` — live-contest and virtual-contest bootstrap
+  extraction, pre-solved virtual problem filtering, problem selector, and the
+  15-minute incremental-sync overlap rule.
+
+A production image intentionally installs only `requirements.txt`; `pytest`
+lives in `requirements-dev.txt`.
 
 ---
 
 ## Project layout
 
-```
-bot.py                 Discord bot: commands, session loop, embeds, buttons
-cf_api.py              Public Codeforces API client + global rate limiter
-estimator.py           Pure numpy estimation engine (no discord / no db)
-storage.py             aiosqlite persistence and problem selection
-plotter.py             Matplotlib PNG chart generator
-requirements.txt       Pinned minimum dependencies
-.env.example           Environment template
-.gitignore             Ignores .env, data/, caches, venv
-tests/test_estimator.py Synthetic unit tests for the estimation engine
-README.md              This file
-```
-
----
-
-## Running the tests
-
-```bash
-pytest -q
-```
-
-The tests use only hardcoded synthetic submissions and observations; they make
-no network calls and do not import `storage.py`.
-
-Covered:
-
-1. earliest-AC deduplication, contest deltas (10/20/45 minutes), practice
-   submissions ignored, five-hour cutoff;
-2. monotonic smoothing of a 1600:35 → 1700:55 → 1800:44 dip;
-3. `recommend_rating` for 15, 30, and 60 minutes plus clamp behaviour;
-4. cold-start fallback for 0, 2, and extreme ratings.
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
+| File | Responsibility |
 | --- | --- |
-| `DISCORD_TOKEN is not set` | Copy `.env.example` to `.env` and paste the token. |
-| `DISCORD_TOKEN is still the placeholder` | Open `.env`, replace `your_discord_bot_token_here` with the real bot token, and save. |
-| Bot ignores `;ihave` | Enable **Message Content Intent** in the Developer Portal; restart the bot. |
-| `RuntimeWarning: coroutine ... was never awaited` | Make sure `bot.run(...)` is the last call and no code after it. |
-| `Codeforces rate limit reached` | Wait a minute. The 2.05s global pacing normally prevents this. |
-| `Codeforces handle ... was not found` | Handles are case-insensitive; check spelling and that the profile exists. |
-| Empty problemset / no problems found | Run `;sync`; the cache may have failed to warm at startup. |
-| Chart missing / font warnings | Matplotlib falls back to DejaVu Sans; no action needed. |
-| First `;ihave` is slow | The problemset cache refresh makes several paced API calls; later runs use SQLite. |
-| Bot restarted mid-session | Sessions are in memory only; run `;ihave` again. |
+| `bot.py` | Discord layer only: slash + prefix commands, buttons, poller, refits via `asyncio.to_thread`. |
+| `predictor.py` | Pure standard-library survival model, tag/era mapping, Newton MAP fit, backtest. |
+| `db.py` | SQLite persistence, migrations, atomic session completion, clean shutdown. |
+| `cf_data.py` | Codeforces HTTP client, compact cache, problem selector, cold-start bootstrapper. |
+| `tests/` | Offline unit tests. |
+| `requirements.txt` / `requirements-dev.txt` | Runtime pins / runtime + pytest. |
+| `Dockerfile`, `docker-compose.yml`, `.dockerignore` | Non-root container and persistent volume. |
 
 ---
 
-## Limitations
+## Known limitations
 
-- Active sessions are in memory, so restarting the bot cancels timers.
-- Only the most recent 10,000 submissions are scanned (`user.status` cap).
-- Contest solve deltas approximate "time spent" by the gap between ACs; a user
-  who thinks for 20 minutes before their first accepted submission is measured
-  exactly that way (the first problem includes all pre-solve thinking).
-- `contest.list` is fetched once per cache refresh purely to filter special
-  contests; the bot still works with the built-in denylist if that call fails.
-- Ratings and tags are hidden in embeds as spoilers; anyone can still click the
-  problem link and see the rating on Codeforces.
+1. **Silent give-ups are invisible.** If a user opens a problem, reads it, and
+   never submits, Codeforces records nothing. Contest-derived data therefore
+   omits the hardest non-attempts and biases `s30` upward.
+2. **Bootstrap solve times include reading time on other problems.** A contest
+   solve measured as "time since the previous AC" also contains reading/thinking
+   on other problems, so contest rows overstate pure solve time. Right-censored
+   end-of-contest timeouts include the same noise.
+3. **Give-ups are informative, not missing-at-random.** People tend to quit when
+   they feel stuck, so right-censoring is correlated with difficulty; the model
+   treats a timeout as "solve time > elapsed", which is the best it can do
+   without observing the counterfactual.
+4. **Blind mode is a Discord-side courtesy.** Rating, effective rating and
+   archetype are spoiler-tagged inside the embed and the bot links to
+   `/contest/<id>/problem/<index>`. If Codeforces shows tags on the problem page
+   under your account settings, they remain visible in the browser.
+5. **`/link` trusts the handle it is given.** There is no profile-token or OAuth
+   ownership verification; the design target is a personal bot or a trusted
+   private Discord server. Anyone who can run `/link` can claim a handle.
