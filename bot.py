@@ -1725,10 +1725,16 @@ class IhHaveBot(commands.Bot):
             lines.append(
                 f"{label:<12}{predicted:>10.2f}{actual:>9.2f}{count:>6}"
             )
+        model = await self.load_predictor(discord_id)
+        s30_sd = float(model.stderr["s30"]) if model else predictor.S30_PRIOR_SD
+        score, label, ece = predictor.compute_calibration_score(result, s30_sd)
+
         embed = discord.Embed(
             title=f"📈 Calibration — @{user.get('cf_handle')}",
             color=EMBED_COLOR,
             description=(
+                f"**Bot Accuracy Score:** **{score} / 100** ({label})\n"
+                f"**Avg Bin Gap (ECE):** ±{ece * 100:.1f}%\n"
                 f"**Log-loss:** {result.log_loss:.4f} "
                 f"(coin-flip baseline 0.6931)\n"
                 f"**Brier score:** {result.brier_score:.4f}\n"

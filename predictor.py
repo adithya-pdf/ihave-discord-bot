@@ -1061,6 +1061,39 @@ def walk_forward_backtest(
     )
 
 
+def compute_calibration_score(
+    result: BacktestResult, s30_stderr: float = S30_PRIOR_SD
+) -> tuple[int, str, float]:
+    """Return (score_out_of_100, status_label, weighted_bin_gap_ece)."""
+    if result.n <= 0:
+        return 0, "Not enough data", 1.0
+
+    # 1. Brier skill vs coin-flip (0.25) and oracle ceiling (~0.175): 45 pts
+    brier_skill = _clamp((0.25 - result.brier_score) / (0.25 - 0.175), 0.0, 1.0)
+
+    # 2. Expected Calibration Error (weighted |Predicted - Actual| across bins): 40 pts
+    ece = sum(abs(pred - act) * cnt for pred, act, cnt in result.bins) / result.n
+    calib_honesty = _clamp(1.0 - (ece / 0.25), 0.0, 1.0)
+
+    # 3. Parameter lock-in (S30 stderr shrinking from 150 -> 35): 15 pts
+    lock_in = _clamp((S30_PRIOR_SD - s30_stderr) / (S30_PRIOR_SD - 35.0), 0.0, 1.0)
+
+    raw_score = 45.0 * brier_skill + 40.0 * calib_honesty + 15.0 * lock_in
+    # Dampen slightly if fewer than 15 practice sessions have been evaluated
+    sample_factor = min(1.0, result.n / 15.0)
+    score = int(round(raw_score * (0.6 + 0.4 * sample_factor)))
+
+    if score >= 85:
+        label = "🟢 Dialed-In Oracle"
+    elif score >= 70:
+        label = "🟢 Strong"
+    elif score >= 50:
+        label = "🟡 Warming Up"
+    else:
+        label = "🔴 Uncalibrated / Cold Start"
+    return score, label, ece
+
+
 __all__ = [
     "ARCHETYPE_MAP",
     "ARCHETYPE_NAMES",
@@ -1081,6 +1114,7 @@ __all__ = [
     "N_ARCHETYPES",
     "N_PARAMS",
     "S30_PRIOR_SD",
+    "compute_calibration_score",
     "effective_time",
     "format_minutes",
     "get_archetypes",
